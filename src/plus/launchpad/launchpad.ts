@@ -39,6 +39,7 @@ import { GitCloudHostIntegrationId, GitSelfManagedHostIntegrationId } from '../.
 import { proBadge, urls } from '../../constants.js';
 import type { LaunchpadTelemetryContext, Source, Sources, TelemetryEvents } from '../../constants.telemetry.js';
 import type { Container } from '../../container.js';
+import { AuthenticationError } from '../../errors.js';
 import type { QuickPickItemOfT } from '../../quickpicks/items/common.js';
 import { createQuickPickItemOfT, createQuickPickSeparator } from '../../quickpicks/items/common.js';
 import type { DirectiveQuickPickItem } from '../../quickpicks/items/directive.js';
@@ -51,6 +52,7 @@ import { getScopedCounter } from '../../system/counter.js';
 import { fromNow } from '../../system/date.js';
 import { some } from '../../system/iterable.js';
 import { Logger } from '../../system/logger.js';
+import { AggregateError } from '../../system/promise.js';
 import { interpolate, pluralize } from '../../system/string.js';
 import { ProviderBuildStatusState, ProviderPullRequestReviewState } from '../integrations/providers/models.js';
 import type { LaunchpadCategorizedResult, LaunchpadItem } from './launchpadProvider.js';
@@ -654,18 +656,7 @@ export class LaunchpadCommand extends QuickCommand<State> {
 
 			// Add error information item if there's an error but items were still loaded
 			const errorItem: DirectiveQuickPickItem | undefined =
-				result?.error != null
-					? createDirectiveQuickPickItem(Directive.Noop, false, {
-							label: '$(warning) Unable to fully load items',
-							detail:
-								result.error.name === 'HttpError' &&
-								'status' in result.error &&
-								typeof result.error.status === 'number'
-									? `${result.error.status}: ${String(result.error)}`
-									: String(result.error),
-							buttons: [OpenLogsQuickInputButton],
-						})
-					: undefined;
+				result?.error != null ? createErrorQuickPickItem(result.error) : undefined;
 
 			const hasPicked = items.some(i => i.picked);
 			if (context.inSearch === 'mode') {
@@ -706,6 +697,27 @@ export class LaunchpadCommand extends QuickCommand<State> {
 							...getLaunchpadQuickPickItems(result.items, isFiltering),
 						],
 			};
+		}
+
+		function createErrorQuickPickItem(error: Error): DirectiveQuickPickItem {
+			if (error instanceof AggregateError) {
+				const firstAuthError = error.errors.find(e => e instanceof AuthenticationError);
+				error = firstAuthError ?? error.errors[0] ?? error;
+			}
+
+			const isAuthError = error instanceof AuthenticationError;
+
+			return createDirectiveQuickPickItem(Directive.Noop, false, {
+				label: isAuthError ? '$(warning) Authentication Required' : '$(warning) Unable to fully load items',
+				detail: isAuthError
+					? `${String(error)} — Click to reconnect your integration`
+					: error.name === 'HttpError' && 'status' in error && typeof error.status === 'number'
+						? `${error.status}: ${String(error)}`
+						: String(error),
+				buttons: isAuthError
+					? [ConnectIntegrationButton, OpenLogsQuickInputButton]
+					: [OpenLogsQuickInputButton],
+			});
 		}
 
 		const updateItems = async (
@@ -868,6 +880,11 @@ export class LaunchpadCommand extends QuickCommand<State> {
 
 				if (button === OpenLogsQuickInputButton) {
 					Logger.showOutputChannel();
+					return;
+				}
+
+				if (button === ConnectIntegrationButton) {
+					await this.container.integrations.manageCloudIntegrations({ source: 'launchpad' });
 					return;
 				}
 
