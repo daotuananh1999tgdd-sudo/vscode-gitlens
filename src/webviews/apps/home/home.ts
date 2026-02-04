@@ -123,7 +123,6 @@ export class GlHomeApp extends GlAppHost<State> {
 						`,
 					)}
 				</main>
-				<gl-welcome-overlay .isLightTheme=${this.isLightTheme} .webroot=${this.webroot}></gl-welcome-overlay>
 			</div>
 		`;
 	}
