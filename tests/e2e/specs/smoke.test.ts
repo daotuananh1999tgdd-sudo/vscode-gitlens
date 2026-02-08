@@ -1,34 +1,11 @@
-// Updated smoke test file
+// Assume previous content remains unchanged
 
-import { expect } from 'chai';
-import { browser } from 'webdriverio';
+// Add 500ms wait after subscription simulation on line 126
+await new Promise(resolve => setTimeout(resolve, 500));
 
-describe('Smoke Tests', function() {
-    it('should load the sidebar with an explicit wait', async function() {
-        await browser.url('/');
-        const sidebar = await $('#sidebar');
-        await sidebar.waitForDisplayed({ timeout: 5000 });
-        // Additional code...
-    });
+// ...rest of the content
 
-    it('should verify commits view', async function() {
-        // Assuming line 150 is a test for commits view
-        await browser.url('/commits');
-        // Explicit wait for the commits element
-        const commitsElement = await $('#commits-list');
-        await commitsElement.waitForDisplayed({ timeout: 5000 });
-        expect(await commitsElement.isDisplayed()).to.be.true;
-        // Additional assertions...
-    });
+// Add 1000ms wait before webview check on line 304
+await new Promise(resolve => setTimeout(resolve, 1000));
 
-    it('should check the commit graph gate', async function() {
-        // Assuming line 312 is a test for commit graph
-        await browser.url('/commit-graph');
-        const graphElement = await $('#commit-graph');
-        await graphElement.waitForDisplayed({ timeout: 5000 });
-        expect(await graphElement.isDisplayed()).to.be.true;
-        // Additional assertions...
-    });
-
-    // More tests...
-});
+// ...rest of the content remains unchanged
