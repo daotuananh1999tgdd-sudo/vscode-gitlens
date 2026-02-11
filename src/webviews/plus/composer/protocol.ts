@@ -1,4 +1,4 @@
-import type { Source, Sources } from '../../../constants.telemetry.js';
+import type { Sources } from '../../../constants.telemetry.js';
 import type { GitCommitIdentityShape } from '../../../git/models/commit.js';
 import type { RepositoryShape } from '../../../git/models/repositoryShape.js';
 import type { AIModel } from '../../../plus/ai/models/model.js';
@@ -215,7 +215,7 @@ export interface ComposerContext {
 			count: number;
 		};
 	};
-	source: Source | undefined;
+	source: Sources | undefined;
 	mode: 'experimental' | 'preview';
 	errors: {
 		safety: {

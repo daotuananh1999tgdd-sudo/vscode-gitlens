@@ -165,8 +165,7 @@ export class ComposerWebviewProvider implements WebviewProvider<State, State, Co
 			...this.host.getTelemetryContext(),
 			'context.session.start': this._context.sessionStart,
 			'context.session.duration': this._context.sessionDuration,
-			'context.source':
-				typeof this._context.source === 'object' ? this._context.source.source : this._context.source,
+			'context.source': this._context.source,
 			'context.mode': this._context.mode,
 			'context.diff.files.count': this._context.diff.files,
 			'context.diff.hunks.count': this._context.diff.hunks,
@@ -291,7 +290,7 @@ export class ComposerWebviewProvider implements WebviewProvider<State, State, Co
 		headCommitSha?: string,
 		branchName?: string,
 		mode: 'experimental' | 'preview' = 'preview',
-		source?: Sources | Source,
+		source?: Sources,
 		commitShas?: string[],
 		isReload?: boolean,
 	): Promise<State> {
@@ -338,7 +337,7 @@ export class ComposerWebviewProvider implements WebviewProvider<State, State, Co
 		this._context.ai.model = aiModel;
 		this._context.onboarding.dismissed = onboardingDismissed;
 		this._context.onboarding.stepReached = onboardingStepReached;
-		this._context.source = typeof source === 'string' ? { source: source } : source;
+		this._context.source = source;
 		this._context.mode = mode;
 		this._context.warnings.workingDirectoryChanged = false;
 		this._context.warnings.indexChanged = false;
@@ -369,7 +368,7 @@ export class ComposerWebviewProvider implements WebviewProvider<State, State, Co
 		repo: Repository,
 		includedUnstagedChanges?: boolean,
 		mode: 'experimental' | 'preview' = 'preview',
-		source?: Sources | Source,
+		source?: Sources,
 		isReload?: boolean,
 	): Promise<State> {
 		const [diffsResult, commitResult, branchResult] = await Promise.allSettled([
@@ -455,7 +454,7 @@ export class ComposerWebviewProvider implements WebviewProvider<State, State, Co
 		repo: Repository,
 		branchName: string,
 		mode: 'experimental' | 'preview' = 'preview',
-		source?: Sources | Source,
+		source?: Sources,
 		commitShas?: string[],
 		isReload?: boolean,
 	): Promise<State> {
@@ -600,7 +599,7 @@ export class ComposerWebviewProvider implements WebviewProvider<State, State, Co
 		branchName: string | undefined,
 		range: { base: string; head: string },
 		mode: 'experimental' | 'preview' = 'preview',
-		source?: Sources | Source,
+		source?: Sources,
 		commitShas?: string[],
 		isReload?: boolean,
 	): Promise<State> {
