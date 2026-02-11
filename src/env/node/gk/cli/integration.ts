@@ -108,10 +108,9 @@ export class GkCliIntegrationProvider implements Disposable {
 	}
 
 	private supportsCliIntegration(): boolean {
-		return (
-			this.container.ai.enabled &&
-			(configuration.get('gitkraken.mcp.autoEnabled') || configuration.get('gitkraken.cli.integration.enabled'))
-		);
+		if (mcpExtensionRegistrationAllowed(this.container)) return true;
+
+		return configuration.get('gitkraken.cli.integration.enabled');
 	}
 
 	private async start() {
