@@ -103,17 +103,6 @@ export async function* ensureAccessStep<
 				createQuickPickSeparator(),
 			);
 			break;
-		case 'startReview':
-			directives.splice(
-				0,
-				0,
-				createDirectiveQuickPickItem(Directive.Noop, undefined, {
-					label: 'Start reviewing a pull request from your connected integrations',
-					iconPath: new ThemeIcon('git-pull-request'),
-				}),
-				createQuickPickSeparator(),
-			);
-			break;
 		case 'startWork':
 			directives.splice(
 				0,
