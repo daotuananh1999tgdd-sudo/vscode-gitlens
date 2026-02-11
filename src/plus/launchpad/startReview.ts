@@ -598,18 +598,12 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 	}
 
 	private sendItemActionTelemetry(action: 'soft-open', item: StartReviewItem, context: StartReviewContext) {
-		if (!this.container.telemetry.enabled) return;
-
-		this.container.telemetry.sendEvent(
-			`${this.telemetryEventKey}/pr/action`,
-			{
-				...context.telemetryContext!,
-				...buildItemTelemetryData(item),
-				action: action,
-				connected: true,
-			},
-			this.source,
-		);
+		this.container.telemetry.sendEvent(`${this.telemetryEventKey}/pr/action`, {
+			...context.telemetryContext!,
+			...buildItemTelemetryData(item),
+			action: action,
+			connected: true,
+		});
 	}
 
 	private sendTitleActionTelemetry(action: 'connect', context: StartReviewContext) {
