@@ -101,11 +101,9 @@ interface StartReviewResult {
 
 export interface StartReviewContext extends StepsContext<StepNames> {
 	result?: StartReviewResult;
-	searchResult?: StartReviewResult;
 	title: string;
 	telemetryContext: StartReviewTelemetryContext | undefined;
 	connectedIntegrations: Map<IntegrationIds, boolean>;
-	inSearch: boolean;
 }
 
 interface StartReviewState {
@@ -148,7 +146,7 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 			description: 'Start a review for a pull request',
 		});
 
-		this.source = args?.source ?? { source: 'commandPalette' };
+		this.source = { source: args?.source ?? 'commandPalette' };
 
 		if (this.container.telemetry.enabled) {
 			this.telemetryContext = { instance: instanceCounter.next() };
@@ -174,11 +172,9 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 			...context,
 			container: this.container,
 			result: undefined,
-			searchResult: undefined,
 			title: this.title,
 			telemetryContext: this.telemetryContext,
 			connectedIntegrations: undefined!,
-			inSearch: false,
 		};
 	}
 
@@ -476,7 +472,7 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 	): AsyncStepResultGenerator<StartReviewItem> {
 		const hasDisconnectedIntegrations = [...context.connectedIntegrations.values()].some(c => !c);
 
-		const buildPullRequestQuickPickItem = (i: StartReviewItem, alwaysShow?: boolean) => {
+		const buildPullRequestQuickPickItem = (i: StartReviewItem) => {
 			const buttons = getOpenOnGitProviderQuickInputButtons(i.launchpadItem.provider.id);
 			return {
 				label:
@@ -487,34 +483,29 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 				detail: `      ${fromNow(i.launchpadItem.updatedDate)} by @${i.launchpadItem.author?.username ?? 'unknown'}`,
 				iconPath:
 					i.launchpadItem.author?.avatarUrl != null ? Uri.parse(i.launchpadItem.author.avatarUrl) : undefined,
-				alwaysShow: alwaysShow,
 				item: i,
 				picked: i.launchpadItem.uuid === state.item?.launchpadItem.uuid,
 				buttons: buttons,
 			};
 		};
 
-		const getItems = (result: StartReviewResult, isFiltering?: boolean) => {
+		const getItems = (result: StartReviewResult) => {
 			const items: QuickPickItemOfT<StartReviewItem>[] = [];
 
 			if (result.items?.length) {
-				items.push(...result.items.map(i => buildPullRequestQuickPickItem(i, isFiltering)));
+				items.push(...result.items.map(buildPullRequestQuickPickItem));
 			}
 
 			return items;
 		};
 
-		function getItemsAndPlaceholder(isFiltering?: boolean): {
+		function getItemsAndPlaceholder(): {
 			placeholder: string;
 			items: (DirectiveQuickPickItem | QuickPickItemOfT<StartReviewItem | undefined>)[];
 		} {
-			const result = context.inSearch ? context.searchResult : context.result;
-
-			if (!result?.items.length) {
+			if (!context.result?.items.length) {
 				return {
-					placeholder: context.inSearch
-						? 'No pull requests found matching your search'
-						: 'No pull requests found. Paste a PR URL or connect more integrations.',
+					placeholder: 'No pull requests found. Paste a PR URL or connect more integrations.',
 					items: [
 						hasDisconnectedIntegrations ? connectMoreIntegrationsItem : manageIntegrationsItem,
 						createDirectiveQuickPickItem(Directive.Cancel),
@@ -524,15 +515,15 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 
 			return {
 				placeholder: 'Choose a pull request to review or paste a PR URL',
-				items: [...getItems(result, isFiltering), createDirectiveQuickPickItem(Directive.Cancel)],
+				items: [...getItems(context.result), createDirectiveQuickPickItem(Directive.Cancel)],
 			};
 		}
 
-		const updateItems = async (quickpick: QuickPick<any>, options?: { search?: string }) => {
+		const updateItems = async (quickpick: QuickPick<any>) => {
 			quickpick.busy = true;
 			try {
-				await updateContextItems(this.container, context, options);
-				const { items, placeholder } = getItemsAndPlaceholder(Boolean(options?.search));
+				await updateContextItems(this.container, context);
+				const { items, placeholder } = getItemsAndPlaceholder();
 				quickpick.placeholder = placeholder;
 				quickpick.items = items;
 			} catch {
@@ -572,48 +563,7 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 						return false;
 				}
 			},
-			onDidChangeValue: async quickpick => {
-				const { value } = quickpick;
-
-				// Nothing to search
-				if (!value?.length) {
-					context.searchResult = undefined;
-					if (context.inSearch) {
-						context.inSearch = false;
-					}
-
-					// Restore normal items
-					const { items, placeholder } = getItemsAndPlaceholder();
-					quickpick.placeholder = placeholder;
-					quickpick.items = items as any;
-
-					return true;
-				}
-
-				// In API search mode, search the API and update the quickpick
-				if (context.inSearch || this.container.launchpad.isMaybeSupportedLaunchpadPullRequestSearchUrl(value)) {
-					if (!context.inSearch) {
-						// Hide items quickly when entering search mode
-						quickpick.items = [createDirectiveQuickPickItem(Directive.Cancel)] as any;
-						context.inSearch = true;
-					}
-
-					await updateItems(quickpick, { search: value });
-				} else {
-					// Out of API search mode - user is typing non-URL text
-					context.searchResult = undefined;
-					if (context.inSearch) {
-						context.inSearch = false;
-					}
-
-					// Show normal items (filtered by VS Code's built-in matching)
-					const { items, placeholder } = getItemsAndPlaceholder();
-					quickpick.placeholder = placeholder;
-					quickpick.items = items as any;
-				}
-
-				return true;
-			},
+			onDidChangeValue: () => true,
 		});
 
 		const selection: StepSelection<typeof step> = yield step;
@@ -683,36 +633,24 @@ export class StartReviewCommand extends QuickCommand<StartReviewState> {
 	}
 }
 
-async function updateContextItems(container: Container, context: StartReviewContext, options?: { search?: string }) {
+async function updateContextItems(container: Container, context: StartReviewContext) {
 	context.connectedIntegrations = await container.launchpad.getConnectedIntegrations();
 
 	// Get PRs from launchpad that need review
-	const result: LaunchpadCategorizedResult = options?.search
-		? await container.launchpad.getCategorizedItems({ search: options.search })
-		: await container.launchpad.getCategorizedItems();
+	const result: LaunchpadCategorizedResult = await container.launchpad.getCategorizedItems();
 
 	if (result.error != null) {
-		if (options?.search) {
-			context.searchResult = { items: [] };
-		} else {
-			context.result = { items: [] };
-		}
+		context.result = { items: [] };
 		return;
 	}
 
 	// Filter to PRs that need review (not authored by current user, or explicitly in needs-my-review category)
-	// Skip filtering when searching by URL - show the specific PR regardless of author
-	const reviewablePrs = options?.search
-		? (result.items ?? [])
-		: (result.items?.filter(item => item.actionableCategory === 'needs-my-review' || !item.viewer.isAuthor) ?? []);
+	const reviewablePrs =
+		result.items?.filter(item => item.actionableCategory === 'needs-my-review' || !item.viewer.isAuthor) ?? [];
 
-	const mappedItems = reviewablePrs.map(launchpadItem => ({ launchpadItem: launchpadItem }));
-
-	if (options?.search) {
-		context.searchResult = { items: mappedItems };
-	} else {
-		context.result = { items: mappedItems };
-	}
+	context.result = {
+		items: reviewablePrs.map(launchpadItem => ({ launchpadItem: launchpadItem })),
+	};
 
 	if (container.telemetry.enabled) {
 		updateTelemetryContext(context);
