@@ -160,32 +160,23 @@ export class GkCliIntegrationProvider implements Disposable {
 	}
 
 	private ensureAutoInstall() {
-		let forceInstall = false;
 		const cliInstall = this.container.storage.getScoped('gk:cli:install');
 		if (cliInstall?.status === 'completed') {
-			if (!cliInstall.version || satisfies(fromString(cliInstall.version), '< 3.1.52')) {
-				forceInstall = true;
-			} else {
-				void setContext('gitlens:gk:cli:installed', true);
-				return;
-			}
+			void setContext('gitlens:gk:cli:installed', true);
+			return;
 		}
 
 		// Reset the attempts count if GitLens extension version has changed
-		if (
-			forceInstall ||
-			(reachedMaxAttempts(cliInstall) && this.container.version !== this.container.previousVersion)
-		) {
+		if (reachedMaxAttempts(cliInstall) && this.container.version !== this.container.previousVersion) {
 			void this.container.storage.storeScoped('gk:cli:install', undefined);
 		}
 
-		const shouldAutoInstall = mcpExtensionRegistrationAllowed(this.container) && !reachedMaxAttempts(cliInstall);
-		if (!forceInstall && !shouldAutoInstall) {
+		if (!mcpExtensionRegistrationAllowed(this.container) || reachedMaxAttempts(cliInstall)) {
 			return;
 		}
 
 		// Setup MCP, but handle errors silently
-		void this.setupMCPCore('gk-cli-integration', forceInstall, shouldAutoInstall).catch(() => {});
+		void this.setupMCPCore('gk-cli-integration', false, true).catch(() => {});
 	}
 
 	@gate()
@@ -725,7 +716,6 @@ export class GkCliIntegrationProvider implements Disposable {
 						throw new Error(`Failed to find core directory in install output: ${coreInstallOutput}`);
 					}
 
-					// TODO: Include version in this logger
 					Logger.log(scope, 'CLI install completed');
 					cliInstallStatus = 'completed';
 					void this.container.storage
