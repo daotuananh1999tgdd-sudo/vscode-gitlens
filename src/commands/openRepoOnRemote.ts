@@ -1,13 +1,16 @@
-import { TextEditor, Uri, window } from 'vscode';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { RemoteResourceType } from '../git/remotes/provider';
-import { Logger } from '../logger';
-import { RepositoryPicker } from '../quickpicks/repositoryPicker';
-import { command, executeCommand } from '../system/command';
-import { ActiveEditorCommand, CommandContext, getCommandUri, isCommandContextViewNodeHasRemote } from './base';
-import { OpenOnRemoteCommandArgs } from './openOnRemote';
+import type { TextEditor, Uri } from 'vscode';
+import type { Container } from '../container.js';
+import { GitUri } from '../git/gitUri.js';
+import { RemoteResourceType } from '../git/models/remoteResource.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { getBestRepositoryOrShowPicker } from '../quickpicks/repositoryPicker.js';
+import { command, executeCommand } from '../system/-webview/command.js';
+import { Logger } from '../system/logger.js';
+import { ActiveEditorCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
+import type { CommandContext } from './commandContext.js';
+import { isCommandContextViewNodeHasRemote } from './commandContext.utils.js';
+import type { OpenOnRemoteCommandArgs } from './openOnRemote.js';
 
 export interface OpenRepoOnRemoteCommandArgs {
 	clipboard?: boolean;
@@ -17,28 +20,29 @@ export interface OpenRepoOnRemoteCommandArgs {
 @command()
 export class OpenRepoOnRemoteCommand extends ActiveEditorCommand {
 	constructor(private readonly container: Container) {
-		super([Commands.OpenRepoOnRemote, Commands.Deprecated_OpenRepoInRemote, Commands.CopyRemoteRepositoryUrl]);
+		super(['gitlens.openRepoOnRemote', 'gitlens.copyRemoteRepositoryUrl'], ['gitlens.openRepoInRemote']);
 	}
 
-	protected override preExecute(context: CommandContext, args?: OpenRepoOnRemoteCommandArgs) {
+	protected override preExecute(context: CommandContext, args?: OpenRepoOnRemoteCommandArgs): Promise<void> {
 		if (isCommandContextViewNodeHasRemote(context)) {
 			args = { ...args, remote: context.node.remote.name };
 		}
 
-		if (context.command === Commands.CopyRemoteRepositoryUrl) {
+		if (context.command === 'gitlens.copyRemoteRepositoryUrl') {
 			args = { ...args, clipboard: true };
 		}
 
 		return this.execute(context.editor, context.uri, args);
 	}
 
-	async execute(editor?: TextEditor, uri?: Uri, args?: OpenRepoOnRemoteCommandArgs) {
+	async execute(editor?: TextEditor, uri?: Uri, args?: OpenRepoOnRemoteCommandArgs): Promise<void> {
 		uri = getCommandUri(uri, editor);
 
 		const gitUri = uri != null ? await GitUri.fromUri(uri) : undefined;
 
 		const repoPath = (
-			await RepositoryPicker.getBestRepositoryOrShow(
+			await getBestRepositoryOrShowPicker(
+				this.container,
 				gitUri,
 				editor,
 				args?.clipboard
@@ -49,7 +53,7 @@ export class OpenRepoOnRemoteCommand extends ActiveEditorCommand {
 		if (!repoPath) return;
 
 		try {
-			void (await executeCommand<OpenOnRemoteCommandArgs>(Commands.OpenOnRemote, {
+			void (await executeCommand<OpenOnRemoteCommandArgs>('gitlens.openOnRemote', {
 				resource: {
 					type: RemoteResourceType.Repo,
 				},
@@ -59,9 +63,7 @@ export class OpenRepoOnRemoteCommand extends ActiveEditorCommand {
 			}));
 		} catch (ex) {
 			Logger.error(ex, 'OpenRepoOnRemoteCommand');
-			void window.showErrorMessage(
-				'Unable to open repository on remote provider. See output channel for more details',
-			);
+			void showGenericErrorMessage('Unable to open repository on remote provider');
 		}
 	}
 }

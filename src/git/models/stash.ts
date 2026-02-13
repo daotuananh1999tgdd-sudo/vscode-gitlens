@@ -1,6 +1,6 @@
-import { GitStashCommit } from './commit';
+import type { GitStashCommit } from './commit.js';
 
 export interface GitStash {
 	readonly repoPath: string;
-	readonly commits: Map<string, GitStashCommit>;
+	readonly stashes: ReadonlyMap<string, GitStashCommit>;
 }

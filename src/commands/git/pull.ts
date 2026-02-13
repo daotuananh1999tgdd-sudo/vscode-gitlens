@@ -1,36 +1,47 @@
-import { GlyphChars } from '../../constants';
-import { Container } from '../../container';
-import { GitBranch, GitBranchReference, GitReference, Repository } from '../../git/models';
-import { Directive, DirectiveQuickPickItem } from '../../quickpicks/items/directive';
-import { FlagsQuickPickItem } from '../../quickpicks/items/flags';
-import { isStringArray } from '../../system/array';
-import { fromNow } from '../../system/date';
-import { pad, pluralize } from '../../system/string';
-import { ViewsWithRepositoryFolders } from '../../views/viewBase';
-import {
-	appendReposToTitle,
+import { GlyphChars } from '../../constants.js';
+import type { Container } from '../../container.js';
+import { isBranch } from '../../git/models/branch.js';
+import type { GitBranchReference } from '../../git/models/reference.js';
+import type { Repository } from '../../git/models/repository.js';
+import { getReferenceLabel, isBranchReference } from '../../git/utils/reference.utils.js';
+import { createDirectiveQuickPickItem, Directive } from '../../quickpicks/items/directive.js';
+import type { FlagsQuickPickItem } from '../../quickpicks/items/flags.js';
+import { createFlagsQuickPickItem } from '../../quickpicks/items/flags.js';
+import { isStringArray } from '../../system/array.js';
+import { fromNow } from '../../system/date.js';
+import { pad, pluralize } from '../../system/string.js';
+import type { ViewsWithRepositoryFolders } from '../../views/viewBase.js';
+import type {
 	AsyncStepResultGenerator,
 	PartialStepState,
-	pickRepositoriesStep,
-	QuickCommand,
-	QuickCommandButtons,
-	QuickPickStep,
 	StepGenerator,
-	StepResult,
+	StepsContext,
 	StepSelection,
 	StepState,
-} from '../quickCommand';
+} from '../quick-wizard/models/steps.js';
+import { StepResultBreak } from '../quick-wizard/models/steps.js';
+import type { QuickPickStep } from '../quick-wizard/models/steps.quickpick.js';
+import { FetchQuickInputButton } from '../quick-wizard/quickButtons.js';
+import { QuickCommand } from '../quick-wizard/quickCommand.js';
+import { pickRepositoriesStep } from '../quick-wizard/steps/repositories.js';
+import { StepsController } from '../quick-wizard/stepsController.js';
+import { appendReposToTitle, assertStepState, canPickStepContinue } from '../quick-wizard/utils/steps.utils.js';
 
-interface Context {
+const Steps = {
+	PickRepos: 'pull-pick-repos',
+	Confirm: 'pull-confirm',
+} as const;
+type StepNames = (typeof Steps)[keyof typeof Steps];
+
+interface Context extends StepsContext<StepNames> {
 	repos: Repository[];
 	associatedView: ViewsWithRepositoryFolders;
 	title: string;
 }
 
 type Flags = '--rebase';
-
-interface State {
-	repos: string | string[] | Repository | Repository[];
+interface State<Repos = string | string[] | Repository | Repository[]> {
+	repos: Repos;
 	reference?: GitBranchReference;
 	flags: Flags[];
 }
@@ -41,31 +52,20 @@ export interface PullGitCommandArgs {
 	state?: Partial<State>;
 }
 
-type PullStepState<T extends State = State> = ExcludeSome<StepState<T>, 'repos', string | string[] | Repository>;
-
 export class PullGitCommand extends QuickCommand<State> {
 	constructor(container: Container, args?: PullGitCommandArgs) {
 		super(container, 'pull', 'pull', 'Pull', {
 			description: 'fetches and integrates changes from a remote into the current branch',
 		});
 
-		let counter = 0;
-		if (args?.state?.repos != null && (!Array.isArray(args.state.repos) || args.state.repos.length !== 0)) {
-			counter++;
-		}
-
-		this.initialState = {
-			counter: counter,
-			confirm: args?.confirm,
-			...args?.state,
-		};
+		this.initialState = { confirm: args?.confirm, ...args?.state };
 	}
 
-	async execute(state: PullStepState) {
-		if (GitReference.isBranch(state.reference)) {
+	private async execute(state: StepState<State<Repository[]>>) {
+		if (isBranchReference(state.reference)) {
 			// Only resort to a branch fetch if the branch isn't the current one
-			if (!GitBranch.is(state.reference) || !state.reference.current) {
-				const currentBranch = await state.repos[0].getBranch();
+			if (!isBranch(state.reference) || !state.reference.current) {
+				const currentBranch = await state.repos[0].git.branches.getBranch();
 				if (currentBranch?.name !== state.reference.name) {
 					return state.repos[0].fetch({ branch: state.reference, pull: true });
 				}
@@ -75,115 +75,124 @@ export class PullGitCommand extends QuickCommand<State> {
 		return this.container.git.pullAll(state.repos, { rebase: state.flags.includes('--rebase') });
 	}
 
-	protected async *steps(state: PartialStepState<State>): StepGenerator {
-		const context: Context = {
+	protected createContext(context?: StepsContext<any>): Context {
+		return {
+			...context,
+			container: this.container,
 			repos: this.container.git.openRepositories,
-			associatedView: this.container.commitsView,
+			associatedView: this.container.views.commits,
 			title: this.title,
 		};
+	}
 
-		if (state.flags == null) {
-			state.flags = [];
-		}
+	protected async *steps(state: PartialStepState<State>, context?: Context): StepGenerator {
+		context ??= this.createContext();
+		using steps = new StepsController<StepNames>(context, this);
+
+		state.flags ??= [];
 
 		if (state.repos != null && !Array.isArray(state.repos)) {
-			state.repos = [state.repos as string];
+			state.repos = typeof state.repos === 'string' ? [state.repos] : [state.repos];
 		}
 
-		let skippedStepOne = false;
+		assertStepState<State<Repository[] | string[]>>(state);
 
-		while (this.canStepsContinue(state)) {
+		while (!steps.isComplete) {
 			context.title = this.title;
 
-			if (state.counter < 1 || state.repos == null || state.repos.length === 0 || isStringArray(state.repos)) {
-				skippedStepOne = false;
+			if (steps.isAtStep(Steps.PickRepos) || !state.repos?.length || isStringArray(state.repos)) {
+				// Only show the picker if there are multiple repositories
 				if (context.repos.length === 1) {
-					skippedStepOne = true;
-					state.counter++;
-
-					state.repos = [context.repos[0]];
+					state.repos = context.repos;
 				} else {
-					const result = yield* pickRepositoriesStep(
-						state as ExcludeSome<typeof state, 'repos', string | Repository>,
-						context,
-						{ skipIfPossible: state.counter >= 1 },
-					);
-					// Always break on the first step (so we will go back)
-					if (result === StepResult.Break) break;
+					using step = steps.enterStep(Steps.PickRepos);
+
+					const result = yield* pickRepositoriesStep(state, context, step, {
+						skipIfPossible: !steps.isAtStep(Steps.PickRepos),
+					});
+					if (result === StepResultBreak) {
+						state.repos = undefined!;
+						if (step.goBack() == null) break;
+						continue;
+					}
 
 					state.repos = result;
 				}
 			}
 
-			if (this.confirm(state.confirm)) {
-				const result = yield* this.confirmStep(state as PullStepState, context);
-				if (result === StepResult.Break) {
-					// If we skipped the previous step, make sure we back up past it
-					if (skippedStepOne) {
-						state.counter--;
-					}
+			assertStepState<State<Repository[]>>(state);
 
+			if (this.confirm(state.confirm)) {
+				using step = steps.enterStep(Steps.Confirm);
+
+				const result = yield* this.confirmStep(state, context);
+				if (result === StepResultBreak) {
+					state.flags = [];
+					if (step.goBack() == null) break;
 					continue;
 				}
 
 				state.flags = result;
 			}
 
-			QuickCommand.endSteps(state);
-			void this.execute(state as PullStepState);
+			await this.execute(state);
+			steps.markStepsComplete();
 		}
 
-		return state.counter < 0 ? StepResult.Break : undefined;
+		return steps.isComplete ? undefined : StepResultBreak;
 	}
 
-	private async *confirmStep(state: PullStepState, context: Context): AsyncStepResultGenerator<Flags[]> {
+	private async *confirmStep(
+		state: StepState<State<Repository[]>>,
+		context: Context,
+	): AsyncStepResultGenerator<Flags[]> {
 		let step: QuickPickStep<FlagsQuickPickItem<Flags>>;
 
 		if (state.repos.length > 1) {
 			step = this.createConfirmStep(appendReposToTitle(`Confirm ${context.title}`, state, context), [
-				FlagsQuickPickItem.create<Flags>(state.flags, [], {
+				createFlagsQuickPickItem<Flags>(state.flags, [], {
 					label: this.title,
-					detail: `Will pull ${state.repos.length} repositories`,
+					detail: `Will pull ${state.repos.length} repos`,
 				}),
-				FlagsQuickPickItem.create<Flags>(state.flags, ['--rebase'], {
+				createFlagsQuickPickItem<Flags>(state.flags, ['--rebase'], {
 					label: `${this.title} with Rebase`,
 					description: '--rebase',
-					detail: `Will pull ${state.repos.length} repositories by rebasing`,
+					detail: `Will pull ${state.repos.length} repos by rebasing`,
 				}),
 			]);
-		} else if (GitReference.isBranch(state.reference)) {
+		} else if (isBranchReference(state.reference)) {
 			if (state.reference.remote) {
 				step = this.createConfirmStep(
 					appendReposToTitle(`Confirm ${context.title}`, state, context),
 					[],
-					DirectiveQuickPickItem.create(Directive.Cancel, true, {
+					createDirectiveQuickPickItem(Directive.Cancel, true, {
 						label: `Cancel ${this.title}`,
 						detail: 'Cannot pull a remote branch',
 					}),
 				);
 			} else {
 				const [repo] = state.repos;
-				const branch = await repo.getBranch(state.reference.name);
+				const branch = await repo.git.branches.getBranch(state.reference.name);
 
 				if (branch?.upstream == null) {
 					step = this.createConfirmStep(
 						appendReposToTitle(`Confirm ${context.title}`, state, context),
 						[],
-						DirectiveQuickPickItem.create(Directive.Cancel, true, {
+						createDirectiveQuickPickItem(Directive.Cancel, true, {
 							label: `Cancel ${this.title}`,
 							detail: 'Cannot pull a branch until it has been published',
 						}),
 					);
 				} else {
 					step = this.createConfirmStep(appendReposToTitle(`Confirm ${context.title}`, state, context), [
-						FlagsQuickPickItem.create<Flags>(state.flags, [], {
+						createFlagsQuickPickItem<Flags>(state.flags, [], {
 							label: this.title,
 							detail: `Will pull${
-								branch.state.behind
-									? ` ${pluralize('commit', branch.state.behind)} into ${GitReference.toString(
+								branch.upstream.state.behind
+									? ` ${pluralize('commit', branch.upstream.state.behind)} into ${getReferenceLabel(
 											branch,
-									  )}`
-									: ` into ${GitReference.toString(branch)}`
+										)}`
+									: ` into ${getReferenceLabel(branch)}`
 							}`,
 						}),
 					]);
@@ -191,26 +200,25 @@ export class PullGitCommand extends QuickCommand<State> {
 			}
 		} else {
 			const [repo] = state.repos;
-			const [status, lastFetched] = await Promise.all([repo.getStatus(), repo.getLastFetched()]);
+			const [status, lastFetched] = await Promise.all([repo.git.status.getStatus(), repo.getLastFetched()]);
 
 			let lastFetchedOn = '';
 			if (lastFetched !== 0) {
 				lastFetchedOn = `${pad(GlyphChars.Dot, 2, 2)}Last fetched ${fromNow(new Date(lastFetched))}`;
 			}
 
-			const pullDetails =
-				status?.state.behind != null
-					? ` ${pluralize('commit', status.state.behind)} into $(repo) ${repo.formattedName}`
-					: ` into $(repo) ${repo.formattedName}`;
+			const pullDetails = status?.upstream?.state.behind
+				? ` ${pluralize('commit', status.upstream.state.behind)} into $(repo) ${repo.name}`
+				: ` into $(repo) ${repo.name}`;
 
 			step = this.createConfirmStep(
 				appendReposToTitle(`Confirm ${context.title}`, state, context, lastFetchedOn),
 				[
-					FlagsQuickPickItem.create<Flags>(state.flags, [], {
+					createFlagsQuickPickItem<Flags>(state.flags, [], {
 						label: this.title,
 						detail: `Will pull${pullDetails}`,
 					}),
-					FlagsQuickPickItem.create<Flags>(state.flags, ['--rebase'], {
+					createFlagsQuickPickItem<Flags>(state.flags, ['--rebase'], {
 						label: `${this.title} with Rebase`,
 						description: '--rebase',
 						detail: `Will pull and rebase${pullDetails}`,
@@ -218,23 +226,21 @@ export class PullGitCommand extends QuickCommand<State> {
 				],
 				undefined,
 				{
-					additionalButtons: [QuickCommandButtons.Fetch],
+					additionalButtons: [FetchQuickInputButton],
 					onDidClickButton: async (quickpick, button) => {
-						if (button !== QuickCommandButtons.Fetch || quickpick.busy) return false;
+						if (button !== FetchQuickInputButton || quickpick.busy) return false;
 
 						quickpick.title = `Confirm ${context.title}${pad(GlyphChars.Dot, 2, 2)}Fetching${
 							GlyphChars.Ellipsis
 						}`;
 
 						quickpick.busy = true;
-						quickpick.enabled = false;
 						try {
 							await repo.fetch({ progress: true });
 							// Signal that the step should be retried
 							return true;
 						} finally {
 							quickpick.busy = false;
-							quickpick.enabled = true;
 						}
 					},
 				},
@@ -242,6 +248,6 @@ export class PullGitCommand extends QuickCommand<State> {
 		}
 
 		const selection: StepSelection<typeof step> = yield step;
-		return QuickCommand.canPickStepContinue(step, state, selection) ? selection[0].item : StepResult.Break;
+		return canPickStepContinue(step, state, selection) ? selection[0].item : StepResultBreak;
 	}
 }

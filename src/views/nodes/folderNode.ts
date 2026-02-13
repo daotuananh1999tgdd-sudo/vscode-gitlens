@@ -1,34 +1,43 @@
 import { ThemeIcon, TreeItem, TreeItemCollapsibleState } from 'vscode';
-import { ViewFilesLayout, ViewsFilesConfig } from '../../configuration';
-import { GitUri } from '../../git/gitUri';
-import { HierarchicalItem } from '../../system/array';
-import { sortCompare } from '../../system/string';
-import { FileHistoryView } from '../fileHistoryView';
-import { StashesView } from '../stashesView';
-import { ViewsWithCommits } from '../viewBase';
-import { ContextValues, ViewNode } from './viewNode';
+import type { ViewFilesLayout, ViewsFilesConfig } from '../../config.js';
+import { GitUri } from '../../git/gitUri.js';
+import type { HierarchicalItem } from '../../system/array.js';
+import { first } from '../../system/iterable.js';
+import { sortCompare } from '../../system/string.js';
+import type { StashesView } from '../stashesView.js';
+import type { ViewsWithCommits } from '../viewBase.js';
+import type { ViewFileNode } from './abstract/viewFileNode.js';
+import { ContextValues, getViewNodeId, ViewNode } from './abstract/viewNode.js';
 
-export interface FileNode extends ViewNode {
+export interface FileNode extends ViewFileNode {
 	folderName: string;
-	label?: string;
 	priority: number;
+
+	label?: string;
 	relativePath?: string;
-	root?: HierarchicalItem<FileNode>;
+
+	// root?: HierarchicalItem<FileNode>;
 }
 
-export class FolderNode extends ViewNode<ViewsWithCommits | FileHistoryView | StashesView> {
+export class FolderNode extends ViewNode<'folder', ViewsWithCommits | StashesView> {
 	readonly priority: number = 1;
 
 	constructor(
-		view: ViewsWithCommits | FileHistoryView | StashesView,
-		parent: ViewNode,
+		view: ViewsWithCommits | StashesView,
+		protected override parent: ViewNode,
+		public readonly root: HierarchicalItem<FileNode>,
 		public readonly repoPath: string,
 		public readonly folderName: string,
-		public readonly root: HierarchicalItem<FileNode>,
+		public readonly relativePath: string | undefined,
 		private readonly containsWorkingFiles?: boolean,
-		public readonly relativePath?: string,
 	) {
-		super(GitUri.fromRepoPath(repoPath), view, parent);
+		super('folder', GitUri.fromFile(relativePath ?? folderName, repoPath), view, parent);
+
+		this._uniqueId = getViewNodeId(`${this.type}+${relativePath ?? folderName}`, this.context);
+	}
+
+	override get id(): string {
+		return this._uniqueId;
 	}
 
 	override toClipboard(): string {
@@ -36,40 +45,51 @@ export class FolderNode extends ViewNode<ViewsWithCommits | FileHistoryView | St
 	}
 
 	getChildren(): (FolderNode | FileNode)[] {
-		if (this.root.descendants === undefined || this.root.children === undefined) return [];
+		if (!this.root.descendants?.length || !this.root.children?.size) return [];
 
 		let children: (FolderNode | FileNode)[];
+		const { compact } = this.view.config.files;
 
 		const nesting = FolderNode.getFileNesting(
 			this.view.config.files,
 			this.root.descendants,
-			this.relativePath === undefined,
+			this.relativePath == null,
 		);
-		if (nesting === ViewFilesLayout.List) {
+		if (nesting === 'list') {
 			this.root.descendants.forEach(n => (n.relativePath = this.root.relativePath));
 			children = this.root.descendants;
 		} else {
 			children = [];
 			for (const folder of this.root.children.values()) {
-				if (folder.value === undefined) {
+				if (folder.value != null) {
+					// Make sure to set the parent
+					folder.value.parent = this.folderName ? this : this.parent;
+					folder.value.relativePath = this.root.relativePath;
+					children.push(folder.value);
+				}
+
+				if (!folder.children?.size) continue;
+				if (folder.children.size === 1 && compact) {
+					const child = first(folder.children.values());
+					if (child?.value != null) {
+						// Make sure to set the parent
+						child.value.parent = this.folderName ? this : this.parent;
+						child.value.relativePath = this.root.relativePath;
+						children.push(child.value);
+					}
+				} else {
 					children.push(
 						new FolderNode(
 							this.view,
-							this.folderName ? this : this.parent!,
+							this.folderName ? this : this.parent,
+							folder,
 							this.repoPath,
 							folder.name,
-							folder,
-							this.containsWorkingFiles,
 							folder.relativePath,
+							this.containsWorkingFiles,
 						),
 					);
-					continue;
 				}
-
-				// Make sure to set the parent
-				(folder.value as any).parent = this.folderName ? this : this.parent!;
-				folder.value.relativePath = this.root.relativePath;
-				children.push(folder.value);
 			}
 		}
 
@@ -86,6 +106,7 @@ export class FolderNode extends ViewNode<ViewsWithCommits | FileHistoryView | St
 
 	getTreeItem(): TreeItem {
 		const item = new TreeItem(this.label, TreeItemCollapsibleState.Expanded);
+		item.id = this.id;
 		item.contextValue = ContextValues.Folder;
 		if (this.containsWorkingFiles) {
 			item.contextValue += '+working';
@@ -104,13 +125,13 @@ export class FolderNode extends ViewNode<ViewsWithCommits | FileHistoryView | St
 		children: T[],
 		isRoot: boolean,
 	): ViewFilesLayout {
-		const nesting = config.layout || ViewFilesLayout.Auto;
-		if (nesting === ViewFilesLayout.Auto) {
+		const nesting = config.layout || 'auto';
+		if (nesting === 'auto') {
 			if (isRoot || config.compact) {
 				const nestingThreshold = config.threshold || 5;
-				if (children.length <= nestingThreshold) return ViewFilesLayout.List;
+				if (children.length <= nestingThreshold) return 'list';
 			}
-			return ViewFilesLayout.Tree;
+			return 'tree';
 		}
 		return nesting;
 	}

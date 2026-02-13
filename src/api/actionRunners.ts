@@ -1,14 +1,18 @@
-import { commands, Disposable, Event, EventEmitter, QuickPickItem, window } from 'vscode';
-import { Config, configuration } from '../configuration';
-import { Commands, ContextKeys } from '../constants';
-import { Container } from '../container';
-import { setContext } from '../context';
-import { sortCompare } from '../system/string';
-import { getQuickPickIgnoreFocusOut } from '../system/utils';
-import type { Action, ActionContext, ActionRunner } from './gitlens';
+import type { Event, QuickPickItem } from 'vscode';
+import { Disposable, EventEmitter, window } from 'vscode';
+import type { Config } from '../config.js';
+import { actionCommandPrefix } from '../constants.commands.js';
+import type { Container } from '../container.js';
+import { registerCommand } from '../system/-webview/command.js';
+import { configuration } from '../system/-webview/configuration.js';
+import { setContext } from '../system/-webview/context.js';
+import { getQuickPickIgnoreFocusOut } from '../system/-webview/vscode.js';
+import { getScopedCounter } from '../system/counter.js';
+import { sortCompare } from '../system/string.js';
+import type { Action, ActionContext, ActionRunner } from './gitlens.d.js';
 
 type Actions = ActionContext['type'];
-const actions: Actions[] = ['createPullRequest', 'openPullRequest', 'hover.commands'];
+const actions: Actions[] = ['createPullRequest', 'openPullRequest', 'openIssue', 'hover.commands'];
 
 // The order here determines the sorting of these actions when shown to the user
 export const enum ActionRunnerType {
@@ -23,7 +27,10 @@ export const builtInActionRunnerName = 'Built In';
 class ActionRunnerQuickPickItem implements QuickPickItem {
 	private readonly _label: string;
 
-	constructor(public readonly runner: RegisteredActionRunner, context: ActionContext) {
+	constructor(
+		public readonly runner: RegisteredActionRunner,
+		context: ActionContext,
+	) {
 		this._label = typeof runner.label === 'string' ? runner.label : runner.label(context);
 	}
 
@@ -48,16 +55,7 @@ class NoActionRunnersQuickPickItem implements QuickPickItem {
 	}
 }
 
-let runnerId = 0;
-function nextRunnerId() {
-	if (runnerId === Number.MAX_SAFE_INTEGER) {
-		runnerId = 1;
-	} else {
-		runnerId++;
-	}
-
-	return runnerId;
-}
+const runnerIdGenerator = getScopedCounter();
 
 class RegisteredActionRunner<T extends ActionContext = ActionContext> implements ActionRunner<T>, Disposable {
 	readonly id: number;
@@ -67,10 +65,10 @@ class RegisteredActionRunner<T extends ActionContext = ActionContext> implements
 		private readonly runner: ActionRunner<T>,
 		private readonly unregister: () => void,
 	) {
-		this.id = nextRunnerId();
+		this.id = runnerIdGenerator.next();
 	}
 
-	dispose() {
+	dispose(): void {
 		this.unregister();
 	}
 
@@ -130,6 +128,7 @@ export class ActionRunners implements Disposable {
 
 	constructor(private readonly container: Container) {
 		const subscriptions: Disposable[] = [
+			this._onDidChange,
 			configuration.onDidChange(e => {
 				if (!configuration.changed(e, 'partners')) return;
 
@@ -139,9 +138,8 @@ export class ActionRunners implements Disposable {
 
 		for (const action of actions) {
 			subscriptions.push(
-				commands.registerCommand(
-					`${Commands.ActionPrefix}${action}`,
-					(context: ActionContext, runnerId?: number) => this.run(context, runnerId),
+				registerCommand(`${actionCommandPrefix}${action}`, (context: ActionContext, runnerId?: number) =>
+					this.run(context, runnerId),
 				),
 			);
 		}
@@ -149,7 +147,7 @@ export class ActionRunners implements Disposable {
 		this._disposable = Disposable.from(...subscriptions);
 	}
 
-	dispose() {
+	dispose(): void {
 		this._disposable.dispose();
 
 		for (const runners of this._actionRunners.values()) {
@@ -165,7 +163,7 @@ export class ActionRunners implements Disposable {
 	}
 
 	get(action: Actions): RegisteredActionRunner[] | undefined {
-		return filterOnlyEnabledRunners(this.container.config, this._actionRunners.get(action));
+		return filterOnlyEnabledRunners(configuration.get('partners'), this._actionRunners.get(action));
 	}
 
 	has(action: Actions): boolean {
@@ -191,13 +189,13 @@ export class ActionRunners implements Disposable {
 		const runnersMap = this._actionRunners;
 
 		const registeredRunner = new RegisteredActionRunner(type, runner, function (this: RegisteredActionRunner) {
-			if (runners!.length === 1) {
+			if (runners.length === 1) {
 				runnersMap.delete(action);
 				onChanged(action);
 			} else {
-				const index = runners!.indexOf(this);
+				const index = runners.indexOf(this);
 				if (index !== -1) {
-					runners!.splice(index, 1);
+					runners.splice(index, 1);
 				}
 			}
 		});
@@ -241,7 +239,7 @@ export class ActionRunners implements Disposable {
 		);
 	}
 
-	async run<T extends ActionContext>(context: T, runnerId?: number) {
+	async run<T extends ActionContext>(context: T, runnerId?: number): Promise<void> {
 		let runners = this.get(context.type);
 		if (runners == null || runners.length === 0) return;
 
@@ -290,6 +288,10 @@ export class ActionRunners implements Disposable {
 								title = 'Open Pull Request';
 								placeholder = 'Choose how to open the pull request';
 								break;
+							case 'openIssue':
+								title = 'Open Issue';
+								placeholder = 'Choose how to open the issue';
+								break;
 							case 'hover.commands':
 								title = 'Need Help or Want to Collaborate?';
 								placeholder = 'Choose what you would like to do';
@@ -312,7 +314,7 @@ export class ActionRunners implements Disposable {
 				runner = pick.runner;
 			} finally {
 				quickpick.dispose();
-				disposables.forEach(d => d.dispose());
+				disposables.forEach(d => void d.dispose());
 			}
 		} else {
 			[runner] = runners;
@@ -322,7 +324,7 @@ export class ActionRunners implements Disposable {
 	}
 
 	private async _updateContextKeys(action: Actions) {
-		await setContext(`${ContextKeys.ActionPrefix}${action}`, this.count(action));
+		await setContext(`gitlens:action:${action}`, this.count(action));
 	}
 
 	private async _updateAllContextKeys() {
@@ -332,10 +334,8 @@ export class ActionRunners implements Disposable {
 	}
 }
 
-function filterOnlyEnabledRunners(config: Config, runners: RegisteredActionRunner[] | undefined) {
+function filterOnlyEnabledRunners(partners: Config['partners'], runners: RegisteredActionRunner[] | undefined) {
 	if (runners == null || runners.length === 0) return undefined;
-
-	const partners = config.partners;
 	if (partners == null) return runners;
 
 	return runners.filter(

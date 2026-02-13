@@ -1,55 +1,69 @@
-import { window } from 'vscode';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { RemoteResourceType } from '../git/remotes/provider';
-import { Logger } from '../logger';
-import { command, executeCommand } from '../system/command';
-import { ResultsCommitsNode } from '../views/nodes';
-import { Command, CommandContext } from './base';
-import { OpenOnRemoteCommandArgs } from './openOnRemote';
+import type { Container } from '../container.js';
+import { RemoteResourceType } from '../git/models/remoteResource.js';
+import type { GitRevisionRangeNotation } from '../git/models/revision.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { command, executeCommand } from '../system/-webview/command.js';
+import { Logger } from '../system/logger.js';
+import { GlCommandBase } from './commandBase.js';
+import type { CommandContext } from './commandContext.js';
+import type { OpenOnRemoteCommandArgs } from './openOnRemote.js';
 
 export interface OpenComparisonOnRemoteCommandArgs {
 	clipboard?: boolean;
 	ref1?: string;
 	ref2?: string;
-	notation?: '..' | '...';
+	notation?: GitRevisionRangeNotation;
 	repoPath?: string;
 }
 
 @command()
-export class OpenComparisonOnRemoteCommand extends Command {
+export class OpenComparisonOnRemoteCommand extends GlCommandBase {
 	constructor(private readonly container: Container) {
-		super([Commands.OpenComparisonOnRemote, Commands.CopyRemoteComparisonUrl]);
+		super(['gitlens.openComparisonOnRemote', 'gitlens.copyRemoteComparisonUrl']);
 	}
 
-	protected override preExecute(context: CommandContext, args?: OpenComparisonOnRemoteCommandArgs) {
+	protected override preExecute(context: CommandContext, args?: OpenComparisonOnRemoteCommandArgs): Promise<void> {
 		if (context.type === 'viewItem') {
-			if (context.node instanceof ResultsCommitsNode) {
+			if (context.node.isAny('results-commits')) {
 				args = {
 					...args,
 					repoPath: context.node.repoPath,
-					ref1: context.node.ref1,
-					ref2: context.node.ref2,
+					ref1: context.node.ref1 || 'HEAD',
+					ref2: context.node.ref2 || 'HEAD',
+				};
+			} else if (context.node.is('compare-results')) {
+				args = {
+					...args,
+					repoPath: context.node.repoPath,
+					ref1: context.node.ahead.ref1,
+					ref2: context.node.ahead.ref2,
+				};
+			} else if (context.node.is('compare-branch')) {
+				args = {
+					...args,
+					repoPath: context.node.repoPath,
+					ref1: context.node.ahead.ref1,
+					ref2: context.node.ahead.ref2,
 				};
 			}
 		}
 
-		if (context.command === Commands.CopyRemoteBranchesUrl) {
+		if (context.command === 'gitlens.copyRemoteComparisonUrl') {
 			args = { ...args, clipboard: true };
 		}
 
 		return this.execute(args);
 	}
 
-	async execute(args?: OpenComparisonOnRemoteCommandArgs) {
+	async execute(args?: OpenComparisonOnRemoteCommandArgs): Promise<void> {
 		if (args?.repoPath == null || args.ref1 == null || args.ref2 == null) return;
 
 		try {
-			void (await executeCommand<OpenOnRemoteCommandArgs>(Commands.OpenOnRemote, {
+			void (await executeCommand<OpenOnRemoteCommandArgs>('gitlens.openOnRemote', {
 				resource: {
 					type: RemoteResourceType.Comparison,
 					base: args.ref1,
-					compare: args.ref2,
+					head: args.ref2,
 					notation: args.notation,
 				},
 				repoPath: args.repoPath,
@@ -57,9 +71,7 @@ export class OpenComparisonOnRemoteCommand extends Command {
 			}));
 		} catch (ex) {
 			Logger.error(ex, 'OpenComparisonOnRemoteCommand');
-			void window.showErrorMessage(
-				'Unable to open comparison on remote provider. See output channel for more details',
-			);
+			void showGenericErrorMessage('Unable to open comparison on remote provider');
 		}
 	}
 }

@@ -1,8 +1,13 @@
-import { ExecException, execFile } from 'child_process';
-import { exists, existsSync, Stats, statSync } from 'fs';
+import type { ExecFileException, ExecFileOptions } from 'child_process';
+import { exec, execFile, spawn } from 'child_process';
+import type { Stats } from 'fs';
+import { access, constants, existsSync, statSync } from 'fs';
 import { join as joinPaths } from 'path';
-import { decode } from 'iconv-lite';
-import { Logger } from '../../../logger';
+import * as process from 'process';
+import { Logger } from '../../../system/logger.js';
+import { getLogScope } from '../../../system/logger.scope.js';
+import { normalizePath } from '../../../system/path.js';
+import { CancelledRunError, RunError } from './shell.errors.js';
 
 export const isWindows = process.platform === 'win32';
 
@@ -52,8 +57,8 @@ function runDownPath(exe: string): string {
 function isExecutable(stats: Stats) {
 	if (isWindows) return true;
 
-	const isGroup = stats.gid ? process.getgid != null && stats.gid === process.getgid() : true;
-	const isUser = stats.uid ? process.getuid != null && stats.uid === process.getuid() : true;
+	const isGroup = stats.gid ? stats.gid === process.getgid?.() : true;
+	const isUser = stats.uid ? stats.uid === process.getuid?.() : true;
 
 	return Boolean(stats.mode & 0o0001 || (stats.mode & 0o0010 && isGroup) || (stats.mode & 0o0100 && isUser));
 }
@@ -113,6 +118,19 @@ export function findExecutable(exe: string, args: string[]): { cmd: string; args
 	return { cmd: exe, args: args };
 }
 
+export async function getWindowsShortPath(path: string): Promise<string> {
+	return new Promise<string>((resolve, reject) => {
+		exec(`for %I in ("${path}") do @echo %~sI`, (error, stdout, _stderr) => {
+			if (error != null) {
+				reject(error);
+				return;
+			}
+
+			resolve(normalizePath(stdout.trim()));
+		});
+	});
+}
+
 export interface RunOptions<TEncoding = BufferEncoding | 'buffer'> {
 	cwd?: string;
 	readonly env?: Record<string, any>;
@@ -125,6 +143,7 @@ export interface RunOptions<TEncoding = BufferEncoding | 'buffer'> {
 	 * enough for most Git operations.
 	 */
 	readonly maxBuffer?: number;
+	readonly signal?: AbortSignal;
 	/**
 	 * An optional string or buffer which will be written to
 	 * the child process stdin stream immediately immediately
@@ -136,64 +155,38 @@ export interface RunOptions<TEncoding = BufferEncoding | 'buffer'> {
 	 * parameter is a string.
 	 */
 	readonly stdinEncoding?: string;
+	readonly timeout?: number;
 }
 
 const bufferExceededRegex = /stdout maxBuffer( length)? exceeded/;
 
-export class RunError extends Error {
-	constructor(
-		private readonly original: ExecException,
-		public readonly stdout: string,
-		public readonly stderr: string,
-	) {
-		super(original.message);
-
-		stdout = stdout.trim();
-		stderr = stderr.trim();
-		Error.captureStackTrace?.(this, RunError);
-	}
-
-	get cmd(): string | undefined {
-		return this.original.cmd;
-	}
-
-	get killed(): boolean | undefined {
-		return this.original.killed;
-	}
-
-	get code(): number | undefined {
-		return this.original.code;
-	}
-
-	get signal(): NodeJS.Signals | undefined {
-		return this.original.signal;
-	}
-}
-
-type ExitCodeOnlyRunOptions = RunOptions & { exitCodeOnly: true };
+type ExitCodeOnlyRunOptions<TEncoding = BufferEncoding | 'buffer'> = RunOptions<TEncoding> & { exitCodeOnly: true };
 
 export function run(
 	command: string,
-	args: any[],
-	encoding: BufferEncoding | 'buffer' | string,
-	options: ExitCodeOnlyRunOptions,
+	args: readonly string[],
+	encoding: BufferEncoding | string,
+	options: ExitCodeOnlyRunOptions<BufferEncoding>,
 ): Promise<number>;
-export function run<T extends string | Buffer>(
+export function run(
 	command: string,
-	args: any[],
-	encoding: BufferEncoding | 'buffer' | string,
-	options?: RunOptions,
-): Promise<T>;
-export function run<T extends number | string | Buffer>(
+	args: readonly string[],
+	encoding: BufferEncoding | string,
+	options?: RunOptions<BufferEncoding>,
+): Promise<string>;
+export function run<T extends number | string>(
 	command: string,
-	args: any[],
-	encoding: BufferEncoding | 'buffer' | string,
-	options?: RunOptions & { exitCodeOnly?: boolean },
+	args: readonly string[],
+	encoding: BufferEncoding | string,
+	options?: RunOptions<BufferEncoding> & { exitCodeOnly?: boolean },
 ): Promise<T> {
-	const { stdin, stdinEncoding, ...opts }: RunOptions = { maxBuffer: 100 * 1024 * 1024, ...options };
+	const { stdin, stdinEncoding, ...opts }: RunOptions<BufferEncoding> & ExecFileOptions = {
+		maxBuffer: 1000 * 1024 * 1024,
+		...options,
+	};
 
 	return new Promise<T>((resolve, reject) => {
-		const proc = execFile(command, args, opts, (error: ExecException | null, stdout, stderr) => {
+		const proc = execFile(command, args, opts, async (error: ExecFileException | null, stdout, stderr) => {
 			if (options?.exitCodeOnly) {
 				resolve((error?.code ?? proc.exitCode) as T);
 
@@ -201,34 +194,51 @@ export function run<T extends number | string | Buffer>(
 			}
 
 			if (error != null) {
+				if (error.signal === 'SIGTERM') {
+					reject(
+						new CancelledRunError(
+							`${command} ${args.join(' ')}`,
+							true,
+							error.code ?? undefined,
+							error.signal,
+						),
+					);
+
+					return;
+				}
+
 				if (bufferExceededRegex.test(error.message)) {
 					error.message = `Command output exceeded the allocated stdout buffer. Set 'options.maxBuffer' to a larger value than ${opts.maxBuffer} bytes`;
 				}
 
-				reject(
-					new RunError(
-						error,
-						encoding === 'utf8' || encoding === 'binary' || encoding === 'buffer'
-							? stdout
-							: decode(Buffer.from(stdout, 'binary'), encoding),
-						encoding === 'utf8' || encoding === 'binary' || encoding === 'buffer'
-							? stderr
-							: decode(Buffer.from(stderr, 'binary'), encoding),
-					),
-				);
+				let stdoutDecoded: string;
+				let stderrDecoded: string;
+				if (encoding === 'utf8' || encoding === 'binary' || encoding === 'buffer') {
+					// stdout & stderr can be `Buffer` or `string
+					// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-conversion
+					stdoutDecoded = stdout.toString();
+					// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-conversion
+					stderrDecoded = stderr.toString();
+				} else {
+					const decode = (await import(/* webpackChunkName: "lib-encoding" */ 'iconv-lite')).decode;
+					stdoutDecoded = decode(Buffer.from(stdout, 'binary'), encoding);
+					stderrDecoded = decode(Buffer.from(stderr, 'binary'), encoding);
+				}
+				reject(new RunError(error, stdoutDecoded, stderrDecoded));
 
 				return;
 			}
 
-			if (stderr) {
-				Logger.warn(`Warning(${command} ${args.join(' ')}): ${stderr}`);
+			if (stderr && Logger.enabled('debug')) {
+				Logger.warn(`[SHELL] '${command} ${args.join(' ')}' \u2022 ${stderr}`);
 			}
 
-			resolve(
-				encoding === 'utf8' || encoding === 'binary' || encoding === 'buffer'
-					? (stdout as T)
-					: (decode(Buffer.from(stdout, 'binary'), encoding) as T),
-			);
+			if (encoding === 'utf8' || encoding === 'binary' || encoding === 'buffer') {
+				resolve(stdout as T);
+			} else {
+				const decode = (await import(/* webpackChunkName: "lib-encoding" */ 'iconv-lite')).decode;
+				resolve(decode(Buffer.from(stdout, 'binary'), encoding) as T);
+			}
 		});
 
 		if (stdin != null) {
@@ -237,6 +247,133 @@ export function run<T extends number | string | Buffer>(
 	});
 }
 
-export function fsExists(path: string) {
-	return new Promise<boolean>(resolve => exists(path, exists => resolve(exists)));
+export interface RunExitResult {
+	exitCode: number;
+}
+
+export interface RunResult<T extends string | Buffer> extends RunExitResult {
+	stdout: T;
+	stderr: T;
+}
+
+export function runSpawn(
+	command: string,
+	args: readonly string[],
+	encoding: BufferEncoding | 'buffer' | string,
+	options: ExitCodeOnlyRunOptions,
+): Promise<RunExitResult>;
+export function runSpawn<T extends string | Buffer>(
+	command: string,
+	args: readonly string[],
+	encoding: BufferEncoding | 'buffer' | string,
+	options: RunOptions,
+): Promise<RunResult<T>>;
+export function runSpawn<T extends string | Buffer>(
+	command: string,
+	args: readonly string[],
+	encoding: BufferEncoding | 'buffer' | string,
+	options: RunOptions & { exitCodeOnly?: boolean },
+): Promise<RunExitResult | RunResult<T>> {
+	const scope = getLogScope();
+
+	const { stdin, stdinEncoding, ...opts }: RunOptions = options;
+
+	return new Promise<RunExitResult | RunResult<T>>((resolve, reject) => {
+		const proc = spawn(command, args, opts);
+
+		const stdoutBuffers: Buffer[] = [];
+		proc.stdout.on('data', (data: Buffer) => stdoutBuffers.push(data));
+
+		const stderrBuffers: Buffer[] = [];
+		proc.stderr.on('data', (data: Buffer) => stderrBuffers.push(data));
+
+		function getStdio<T>(
+			encoding: BufferEncoding | 'buffer' | string,
+		): { stdout: T; stderr: T } | Promise<{ stdout: T; stderr: T }> {
+			const stdout = Buffer.concat(stdoutBuffers as ReadonlyArray<Uint8Array>);
+			const stderr = Buffer.concat(stderrBuffers as ReadonlyArray<Uint8Array>);
+			if (encoding === 'utf8' || encoding === 'binary') {
+				return { stdout: stdout.toString(encoding) as T, stderr: stderr.toString(encoding) as T };
+			}
+			if (encoding === 'buffer') {
+				return { stdout: stdout as T, stderr: stderr as T };
+			}
+
+			return import(/* webpackChunkName: "lib-encoding" */ 'iconv-lite').then(iconv => {
+				return { stdout: iconv.decode(stdout, encoding) as T, stderr: iconv.decode(stderr, encoding) as T };
+			});
+		}
+
+		proc.once('error', async ex => {
+			if (ex?.name === 'AbortError') {
+				reject(new CancelledRunError(`${command} ${args.join(' ')}`, true));
+
+				return;
+			}
+
+			const stdio = getStdio<string>('utf8');
+			const { stdout, stderr } = stdio instanceof Promise ? await stdio : stdio;
+
+			reject(new RunError(ex, stdout, stderr));
+		});
+
+		proc.once('close', async (code, signal) => {
+			if (options?.exitCodeOnly) {
+				resolve({ exitCode: code ?? 0 });
+
+				return;
+			}
+
+			if (code !== 0 || signal) {
+				const stdio = getStdio<string>('utf8');
+				const { stdout, stderr } = stdio instanceof Promise ? await stdio : stdio;
+				if (stderr.length && Logger.enabled('debug')) {
+					Logger.warn(scope, `[SHELL] '${command} ${args.join(' ')}' \u2022 ${stderr}`);
+				}
+
+				if (signal === 'SIGTERM') {
+					reject(new CancelledRunError(`${command} ${args.join(' ')}`, true, code ?? undefined, signal));
+
+					return;
+				}
+
+				reject(
+					new RunError(
+						{
+							message: `Command failed with exit code ${code}`,
+							code: code,
+							signal: signal ?? undefined,
+						},
+						stdout,
+						stderr,
+					),
+				);
+
+				return;
+			}
+
+			const stdio = getStdio<T>(encoding);
+			const { stdout, stderr } = stdio instanceof Promise ? await stdio : stdio;
+			if (stderr.length && Logger.enabled('debug')) {
+				Logger.warn(
+					scope,
+					`[SHELL] '${command} ${args.join(' ')}' \u2022 ${typeof stderr === 'string' ? stderr : stderr.toString()}`,
+				);
+			}
+
+			resolve({ exitCode: code ?? 0, stdout: stdout, stderr: stderr });
+		});
+
+		if (stdin) {
+			if (typeof stdin === 'string') {
+				proc.stdin.end(stdin, (stdinEncoding ?? 'utf8') as BufferEncoding);
+			} else if (stdin instanceof Buffer) {
+				proc.stdin.end(stdin);
+			}
+		}
+	});
+}
+
+export async function fsExists(path: string): Promise<boolean> {
+	return new Promise<boolean>(resolve => access(path, constants.F_OK, err => resolve(err == null)));
 }

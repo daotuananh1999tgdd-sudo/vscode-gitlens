@@ -1,25 +1,30 @@
-import { Uri } from 'vscode';
-import { isSubscriptionPaidPlan, RequiredSubscriptionPlans, Subscription } from './subscription';
+import type { Uri } from 'vscode';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports
+import { CancellationError as _CancellationError } from 'vscode';
+import type { Response } from '@env/fetch.js';
+import type { RequiredSubscriptionPlanIds, Subscription } from './plus/gk/models/subscription.js';
+import { isSubscriptionPaidPlan } from './plus/gk/utils/subscription.utils.js';
+import type { TokenInfo } from './plus/integrations/authentication/models.js';
 
 export class AccessDeniedError extends Error {
 	public readonly subscription: Subscription;
-	public readonly required: RequiredSubscriptionPlans | undefined;
+	public readonly required: RequiredSubscriptionPlanIds | undefined;
 
-	constructor(subscription: Subscription, required: RequiredSubscriptionPlans | undefined) {
+	constructor(subscription: Subscription, required: RequiredSubscriptionPlanIds | undefined) {
 		let message;
 		if (subscription.account?.verified === false) {
 			message = 'Email verification required';
 		} else if (required != null && isSubscriptionPaidPlan(required)) {
-			message = 'Paid subscription required';
+			message = 'GitLens Pro required';
 		} else {
-			message = 'Subscription required';
+			message = 'Plan required';
 		}
 
 		super(message);
 
 		this.subscription = subscription;
 		this.required = required;
-		Error.captureStackTrace?.(this, AccessDeniedError);
+		Error.captureStackTrace?.(this, new.target);
 	}
 }
 
@@ -35,7 +40,7 @@ export class AccountValidationError extends Error {
 		this.original = original;
 		this.statusCode = statusCode;
 		this.statusText = statusText;
-		Error.captureStackTrace?.(this, AccountValidationError);
+		Error.captureStackTrace?.(this, new.target);
 	}
 }
 
@@ -49,10 +54,22 @@ export class AuthenticationError extends Error {
 	readonly id: string;
 	readonly original?: Error;
 	readonly reason: AuthenticationErrorReason | undefined;
+	readonly authInfo: string;
 
-	constructor(id: string, reason?: AuthenticationErrorReason, original?: Error);
-	constructor(id: string, message?: string, original?: Error);
-	constructor(id: string, messageOrReason: string | AuthenticationErrorReason | undefined, original?: Error) {
+	constructor(info: TokenInfo, reason?: AuthenticationErrorReason, original?: Error);
+	constructor(info: TokenInfo, message?: string, original?: Error);
+	constructor(info: TokenInfo, messageOrReason: string | AuthenticationErrorReason | undefined, original?: Error) {
+		const { providerId: id, type, cloud, scopes, expiresAt } = info;
+		const tokenDetails = [
+			cloud ? 'cloud' : 'self-managed',
+			type,
+			info.microHash,
+			expiresAt && `expiresAt=${isNaN(expiresAt.getTime()) ? expiresAt.toString() : expiresAt.toISOString()}`,
+			scopes && `[${scopes.join(',')}]`,
+		]
+			.filter(v => v)
+			.join(', ');
+		const authInfo = `(token details: ${tokenDetails})`;
 		let message;
 		let reason: AuthenticationErrorReason | undefined;
 		if (messageOrReason == null) {
@@ -79,17 +96,54 @@ export class AuthenticationError extends Error {
 		this.id = id;
 		this.original = original;
 		this.reason = reason;
-		Error.captureStackTrace?.(this, AuthenticationError);
+		this.authInfo = authInfo;
+		Error.captureStackTrace?.(this, new.target);
+	}
+
+	override toString(): string {
+		return `${super.toString()} ${this.authInfo}`;
 	}
 }
 
+export class AuthenticationRequiredError extends Error {
+	constructor() {
+		super('Authentication required');
+
+		Error.captureStackTrace?.(this, new.target);
+	}
+}
+
+export class CancellationError extends _CancellationError {
+	constructor(public readonly original?: Error) {
+		super();
+
+		if (this.original) {
+			if (this.original.message.startsWith('Operation cancelled')) {
+				this.message = this.original.message;
+			} else {
+				this.message = `Operation cancelled; ${this.original.message}`;
+			}
+		} else {
+			this.message = 'Operation cancelled';
+		}
+		Error.captureStackTrace?.(this, new.target);
+	}
+}
+
+export function isCancellationError(ex: unknown): ex is CancellationError {
+	return ex instanceof CancellationError || ex instanceof _CancellationError;
+}
+
 export class ExtensionNotFoundError extends Error {
-	constructor(public readonly extensionId: string, public readonly extensionName: string) {
+	constructor(
+		public readonly extensionId: string,
+		public readonly extensionName: string,
+	) {
 		super(
 			`Unable to find the ${extensionName} extension (${extensionId}). Please ensure it is installed and enabled.`,
 		);
 
-		Error.captureStackTrace?.(this, ExtensionNotFoundError);
+		Error.captureStackTrace?.(this, new.target);
 	}
 }
 
@@ -143,7 +197,31 @@ export class OpenVirtualRepositoryError extends Error {
 		this.original = original;
 		this.reason = reason;
 		this.repoPath = repoPath;
-		Error.captureStackTrace?.(this, OpenVirtualRepositoryError);
+		Error.captureStackTrace?.(this, new.target);
+	}
+}
+
+export class ProviderFetchError extends Error {
+	get status(): number {
+		return this.response.status;
+	}
+
+	get statusText(): string {
+		return this.response.statusText;
+	}
+
+	constructor(
+		provider: string,
+		public readonly response: Response,
+		errors?: { message: string }[],
+	) {
+		super(
+			`${provider} request failed: ${!response.ok ? `(${response.status}) ${response.statusText}. ` : ''}${
+				errors?.length ? errors[0].message : ''
+			}`,
+		);
+
+		Error.captureStackTrace?.(this, new.target);
 	}
 }
 
@@ -154,27 +232,153 @@ export class ProviderNotFoundError extends Error {
 				pathOrUri == null
 					? String(pathOrUri)
 					: typeof pathOrUri === 'string'
-					? pathOrUri
-					: pathOrUri.toString(true)
+						? pathOrUri
+						: pathOrUri.toString(true)
 			}'`,
 		);
 
-		Error.captureStackTrace?.(this, ProviderNotFoundError);
+		Error.captureStackTrace?.(this, new.target);
 	}
 }
 
-export class ProviderRequestClientError extends Error {
-	constructor(public readonly original: Error) {
-		super(original.message);
+export class ProviderNotSupportedError extends Error {
+	constructor(provider: string) {
+		super(`Action is not supported on the ${provider} provider.`);
 
-		Error.captureStackTrace?.(this, ProviderRequestClientError);
+		Error.captureStackTrace?.(this, new.target);
 	}
 }
 
-export class ProviderRequestNotFoundError extends Error {
+export class RequestClientError extends Error {
 	constructor(public readonly original: Error) {
 		super(original.message);
 
-		Error.captureStackTrace?.(this, ProviderRequestNotFoundError);
+		Error.captureStackTrace?.(this, new.target);
+	}
+}
+
+export class RequestNotFoundError extends Error {
+	constructor(public readonly original: Error) {
+		super(original.message);
+
+		Error.captureStackTrace?.(this, new.target);
+	}
+}
+
+export class RequestRateLimitError extends Error {
+	constructor(
+		public readonly original: Error,
+		public readonly token: string | undefined,
+		public readonly resetAt: number | undefined,
+	) {
+		super(original.message);
+
+		Error.captureStackTrace?.(this, new.target);
+	}
+}
+
+export class RequestGoneError extends Error {
+	constructor(public readonly original: Error) {
+		super(original.message);
+
+		Error.captureStackTrace?.(this, new.target);
+	}
+}
+
+export class RequestUnprocessableEntityError extends Error {
+	constructor(public readonly original: Error) {
+		super(original.message);
+
+		Error.captureStackTrace?.(this, new.target);
+	}
+}
+
+export class RequestsAreBlockedTemporarilyError extends Error {
+	constructor() {
+		super('Requests are blocked');
+
+		Error.captureStackTrace?.(this, new.target);
+	}
+}
+
+export class RequiresIntegrationError extends Error {
+	constructor(message: string) {
+		super(message);
+		Error.captureStackTrace?.(this, new.target);
+	}
+}
+
+export const enum AIErrorReason {
+	DeniedByOrganization,
+	DeniedByUser,
+	NoEntitlement,
+	NoRequestData,
+	RateLimitExceeded,
+	RateLimitOrFundsExceeded,
+	RequestTooLarge,
+	ModelNotSupported,
+	ServiceCapacityExceeded,
+	Unauthorized,
+	UserQuotaExceeded,
+}
+
+export class AIError extends Error {
+	readonly original?: Error;
+	readonly reason: AIErrorReason | undefined;
+
+	constructor(reason: AIErrorReason, original?: Error) {
+		let message;
+		switch (reason) {
+			case AIErrorReason.NoEntitlement:
+				message = 'You do not have the required entitlement to use this feature';
+				break;
+			case AIErrorReason.RequestTooLarge:
+				message = 'The request is too large';
+				break;
+			case AIErrorReason.UserQuotaExceeded:
+				message = 'You have exceeded your user token limit';
+				break;
+			case AIErrorReason.RateLimitExceeded:
+				message = 'Rate limit exceeded';
+				break;
+			case AIErrorReason.RateLimitOrFundsExceeded:
+				message = 'Rate limit exceeded or your account is out of funds';
+				break;
+			case AIErrorReason.ServiceCapacityExceeded:
+				message = 'Service capacity exceeded';
+				break;
+			case AIErrorReason.NoRequestData:
+				message = original?.message ?? 'No data was provided for the request';
+				break;
+			case AIErrorReason.ModelNotSupported:
+				message = 'Model not supported for this request';
+				break;
+			case AIErrorReason.Unauthorized:
+				message = 'You are not authorized to use the specified provider or model';
+				break;
+			case AIErrorReason.DeniedByOrganization:
+				message = 'Your organization has denied access to the specified provider or model';
+				break;
+			case AIErrorReason.DeniedByUser:
+				message = 'You have denied access to the specified provider or model';
+				break;
+			default:
+				message = original?.message ?? 'An unknown error occurred';
+				break;
+		}
+
+		super(message);
+
+		this.original = original;
+		this.reason = reason;
+		Error.captureStackTrace?.(this, new.target);
+	}
+}
+
+export class AINoRequestDataError extends AIError {
+	constructor(message?: string) {
+		super(AIErrorReason.NoRequestData, message ? new Error(message) : undefined);
+
+		Error.captureStackTrace?.(this, new.target);
 	}
 }

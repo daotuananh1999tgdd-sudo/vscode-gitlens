@@ -1,21 +1,35 @@
+import type { Platform } from '../node/platform.js';
+
 export const isWeb = true;
+export const isOffline = false;
 
 const _platform = (navigator as any)?.userAgentData?.platform;
 const _userAgent = navigator.userAgent;
 
-export const isLinux = _platform === 'Linux' || _userAgent.indexOf('Linux') >= 0;
-export const isMac = _platform === 'macOS' || _userAgent.indexOf('Macintosh') >= 0;
-export const isWindows = _platform === 'Windows' || _userAgent.indexOf('Windows') >= 0;
+export const isLinux = _platform === 'Linux' || _userAgent.includes('Linux');
+export const isMac = _platform === 'macOS' || _userAgent.includes('Macintosh');
+export const isWindows = _platform === 'Windows' || _userAgent.includes('Windows');
 
-export function getPlatform(): string {
-	if (isWindows) {
-		return 'web-windows';
-	}
-	if (isMac) {
-		return 'web-macOS';
-	}
-	if (isLinux) {
-		return 'web-linux';
-	}
+export function getPlatform(): Platform {
+	if (isWindows) return 'web-windows';
+	if (isMac) return 'web-macOS';
+	if (isLinux) return 'web-linux';
 	return 'web';
+}
+
+export function getTempFile(filename: string): string {
+	return filename;
+}
+
+export function getAltKeySymbol(): string {
+	if (isMac) return '⌥';
+	return 'Alt';
+}
+
+/**
+ * Returns an identifier for the current remote instance.
+ * Not applicable in browser environment.
+ */
+export function getRemoteInstanceIdentifier(): string | undefined {
+	return undefined;
 }

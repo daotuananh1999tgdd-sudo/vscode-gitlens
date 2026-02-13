@@ -1,11 +1,14 @@
-import { TextEditor, Uri } from 'vscode';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { Logger } from '../logger';
-import { Messages } from '../messages';
-import { RepositoryPicker } from '../quickpicks/repositoryPicker';
-import { command } from '../system/command';
-import { ActiveEditorCommand, CommandContext, getCommandUri } from './base';
+import type { TextEditor, Uri } from 'vscode';
+import type { Container } from '../container.js';
+import { createReference } from '../git/utils/reference.utils.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { showComparisonPicker } from '../quickpicks/comparisonPicker.js';
+import { getBestRepositoryOrShowPicker } from '../quickpicks/repositoryPicker.js';
+import { command } from '../system/-webview/command.js';
+import { Logger } from '../system/logger.js';
+import { ActiveEditorCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
+import type { CommandContext } from './commandContext.js';
 
 export interface CompareWithCommandArgs {
 	ref1?: string;
@@ -15,29 +18,26 @@ export interface CompareWithCommandArgs {
 @command()
 export class CompareWithCommand extends ActiveEditorCommand {
 	constructor(private readonly container: Container) {
-		super([
-			Commands.CompareWith,
-			Commands.CompareHeadWith,
-			Commands.CompareWorkingWith,
-			Commands.Deprecated_DiffHeadWith,
-			Commands.Deprecated_DiffWorkingWith,
-		]);
+		super(
+			['gitlens.compareWith', 'gitlens.compareHeadWith', 'gitlens.compareWorkingWith'],
+			['gitlens.diffHeadWith', 'gitlens.diffWorkingWith'],
+		);
 	}
 
-	protected override preExecute(context: CommandContext, args?: CompareWithCommandArgs) {
+	protected override preExecute(context: CommandContext, args?: CompareWithCommandArgs): Promise<void> {
 		switch (context.command) {
-			case Commands.CompareWith:
+			case 'gitlens.compareWith':
 				args = { ...args };
 				break;
 
-			case Commands.CompareHeadWith:
-			case Commands.Deprecated_DiffHeadWith:
+			case 'gitlens.compareHeadWith':
+			case /** @deprecated */ 'gitlens.diffHeadWith':
 				args = { ...args };
 				args.ref1 = 'HEAD';
 				break;
 
-			case Commands.CompareWorkingWith:
-			case Commands.Deprecated_DiffWorkingWith:
+			case 'gitlens.compareWorkingWith':
+			case /** @deprecated */ 'gitlens.diffWorkingWith':
 				args = { ...args };
 				args.ref1 = '';
 				break;
@@ -46,7 +46,7 @@ export class CompareWithCommand extends ActiveEditorCommand {
 		return this.execute(context.editor, context.uri, args);
 	}
 
-	async execute(editor?: TextEditor, uri?: Uri, args?: CompareWithCommandArgs) {
+	async execute(editor?: TextEditor, uri?: Uri, args?: CompareWithCommandArgs): Promise<void> {
 		uri = getCommandUri(uri, editor);
 		args = { ...args };
 
@@ -67,17 +67,27 @@ export class CompareWithCommand extends ActiveEditorCommand {
 					break;
 			}
 
-			const repoPath = (await RepositoryPicker.getBestRepositoryOrShow(uri, editor, title))?.path;
+			const repoPath = (await getBestRepositoryOrShowPicker(this.container, uri, editor, title))?.path;
 			if (!repoPath) return;
 
+			if (args.ref1 == null || args.ref2 == null) {
+				const result = await showComparisonPicker(this.container, repoPath, {
+					head: args.ref1 != null ? createReference(args.ref1, repoPath) : undefined,
+					base: args.ref2 != null ? createReference(args.ref2, repoPath) : undefined,
+					headIncludes: ['branches', 'tags', 'HEAD', 'workingTree'],
+				});
+				if (result == null) return;
+
+				args.ref1 = result.head.ref;
+				args.ref2 = result.base.ref;
+			}
+
 			if (args.ref1 != null && args.ref2 != null) {
-				void (await this.container.searchAndCompareView.compare(repoPath, args.ref1, args.ref2));
-			} else {
-				this.container.searchAndCompareView.selectForCompare(repoPath, args.ref1, { prompt: true });
+				await this.container.views.searchAndCompare.compare(repoPath, args.ref1, args.ref2);
 			}
 		} catch (ex) {
 			Logger.error(ex, 'CompareWithCommmand');
-			void Messages.showGenericErrorMessage('Unable to open comparison');
+			void showGenericErrorMessage('Unable to open comparison');
 		}
 	}
 }

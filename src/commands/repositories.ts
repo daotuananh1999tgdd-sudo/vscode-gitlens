@@ -1,30 +1,32 @@
-import { executeGitCommand } from '../commands/gitCommands.actions';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { command } from '../system/command';
-import { Command } from './base';
+import type { Container } from '../container.js';
+import { executeGitCommand } from '../git/actions.js';
+import { groupRepositories } from '../git/utils/-webview/repository.utils.js';
+import { command } from '../system/-webview/command.js';
+import { GlCommandBase } from './commandBase.js';
 
 @command()
-export class FetchRepositoriesCommand extends Command {
+export class FetchRepositoriesCommand extends GlCommandBase {
 	constructor(private readonly container: Container) {
-		super(Commands.FetchRepositories);
+		super('gitlens.fetchRepositories');
 	}
 
-	async execute() {
+	async execute(): Promise<void> {
+		const grouped = groupRepositories(this.container.git.openRepositories);
+
 		return executeGitCommand({
 			command: 'fetch',
-			state: { repos: this.container.git.openRepositories },
+			state: { repos: [...grouped.keys()] },
 		});
 	}
 }
 
 @command()
-export class PullRepositoriesCommand extends Command {
+export class PullRepositoriesCommand extends GlCommandBase {
 	constructor(private readonly container: Container) {
-		super(Commands.PullRepositories);
+		super('gitlens.pullRepositories');
 	}
 
-	async execute() {
+	async execute(): Promise<void> {
 		return executeGitCommand({
 			command: 'pull',
 			state: { repos: this.container.git.openRepositories },
@@ -33,12 +35,12 @@ export class PullRepositoriesCommand extends Command {
 }
 
 @command()
-export class PushRepositoriesCommand extends Command {
+export class PushRepositoriesCommand extends GlCommandBase {
 	constructor(private readonly container: Container) {
-		super(Commands.PushRepositories);
+		super('gitlens.pushRepositories');
 	}
 
-	async execute() {
+	async execute(): Promise<void> {
 		return executeGitCommand({
 			command: 'push',
 			state: { repos: this.container.git.openRepositories },

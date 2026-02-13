@@ -1,14 +1,9 @@
-import { Disposable } from 'vscode';
-import { Container } from '../container';
-import { Logger } from '../logger';
-import { builtInActionRunnerName } from './actionRunners';
-import type { Action, ActionContext, ActionRunner, GitLensApi } from './gitlens';
+import type { Disposable } from 'vscode';
+import { Container } from '../container.js';
+import { builtInActionRunnerName } from './actionRunners.js';
+import type { Action, ActionContext, ActionRunner, GitLensApi } from './gitlens.d.js';
 
-const emptyDisposable = Object.freeze({
-	dispose: () => {
-		/* noop */
-	},
-});
+const emptyDisposable: Disposable = Object.freeze({ dispose: () => {} });
 
 export class Api implements GitLensApi {
 	readonly #container: Container;
@@ -33,7 +28,8 @@ export class Api implements GitLensApi {
 }
 
 export function preview() {
-	return (target: any, key: string, descriptor: PropertyDescriptor) => {
+	return (_target: any, _key: string, descriptor: PropertyDescriptor): void => {
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-function-type
 		let fn: Function | undefined;
 		if (typeof descriptor.value === 'function') {
 			fn = descriptor.value;
@@ -43,9 +39,10 @@ export function preview() {
 		if (fn == null) throw new Error('Not supported');
 
 		descriptor.value = function (this: any, ...args: any[]) {
-			if (Container.instance.insiders || Logger.isDebugging) return fn!.apply(this, args);
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-return
+			if (Container.instance.prereleaseOrDebugging) return fn.apply(this, args);
 
-			console.error('GitLens preview APIs are only available in the Insiders edition');
+			console.error('GitLens preview APIs are only available in the pre-release edition');
 			return emptyDisposable;
 		};
 	};

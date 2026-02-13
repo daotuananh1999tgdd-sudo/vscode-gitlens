@@ -1,59 +1,63 @@
-import { TextDocumentShowOptions, TextEditor, Uri } from 'vscode';
-import { Commands, GlyphChars, quickPickTitleMaxChars } from '../constants';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { GitReference, GitRevision } from '../git/models';
-import { Messages } from '../messages';
-import { StashPicker } from '../quickpicks/commitPicker';
-import { ReferencePicker } from '../quickpicks/referencePicker';
-import { command, executeCommand } from '../system/command';
-import { basename } from '../system/path';
-import { pad } from '../system/string';
-import { ActiveEditorCommand, getCommandUri } from './base';
-import { DiffWithCommandArgs } from './diffWith';
+import type { TextDocumentShowOptions, TextEditor, Uri } from 'vscode';
+import { GlyphChars, quickPickTitleMaxChars } from '../constants.js';
+import type { Container } from '../container.js';
+import type { DiffRange } from '../git/gitProvider.js';
+import { GitUri } from '../git/gitUri.js';
+import { isBranchReference } from '../git/utils/reference.utils.js';
+import { shortenRevision } from '../git/utils/revision.utils.js';
+import { showNoRepositoryWarningMessage } from '../messages.js';
+import { showReferencePicker } from '../quickpicks/referencePicker.js';
+import { showStashPicker } from '../quickpicks/stashPicker.js';
+import { command, executeCommand } from '../system/-webview/command.js';
+import { selectionToDiffRange } from '../system/-webview/vscode/editors.js';
+import { basename } from '../system/path.js';
+import { pad } from '../system/string.js';
+import { ActiveEditorCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
+import type { DiffWithCommandArgs } from './diffWith.js';
 
 export interface DiffWithRevisionFromCommandArgs {
-	line?: number;
-	showOptions?: TextDocumentShowOptions;
 	stash?: boolean;
+
+	range?: DiffRange;
+	showOptions?: TextDocumentShowOptions;
 }
 
 @command()
 export class DiffWithRevisionFromCommand extends ActiveEditorCommand {
 	constructor(private readonly container: Container) {
-		super(Commands.DiffWithRevisionFrom);
+		super('gitlens.diffWithRevisionFrom');
 	}
 
-	async execute(editor?: TextEditor, uri?: Uri, args?: DiffWithRevisionFromCommandArgs) {
+	async execute(editor?: TextEditor, uri?: Uri, args?: DiffWithRevisionFromCommandArgs): Promise<void> {
 		uri = getCommandUri(uri, editor);
 		if (uri == null) return;
 
 		const gitUri = await GitUri.fromUri(uri);
 		if (!gitUri.repoPath) {
-			void Messages.showNoRepositoryWarningMessage('Unable to open file compare');
+			void showNoRepositoryWarningMessage('Unable to open file comparison');
 
 			return;
 		}
 
 		args = { ...args };
-		if (args.line == null) {
-			args.line = editor?.selection.active.line ?? 0;
-		}
+		args.range ??= selectionToDiffRange(editor?.selection);
 
-		const path = this.container.git.getRelativePath(gitUri, gitUri.repoPath);
+		const svc = this.container.git.getRepositoryService(gitUri.repoPath);
+		const path = svc.getRelativePath(gitUri, gitUri.repoPath);
 
 		let ref;
 		let sha;
 		if (args?.stash) {
 			const title = `Open Changes with Stash${pad(GlyphChars.Dot, 2, 2)}`;
-			const pick = await StashPicker.show(
-				this.container.git.getStash(gitUri.repoPath),
+			const pick = await showStashPicker(
+				svc.stash?.getStash(),
 				`${title}${gitUri.getFormattedFileName({ truncateTo: quickPickTitleMaxChars - title.length })}`,
 				'Choose a stash to compare with',
 				{
 					empty: `No stashes with '${gitUri.getFormattedFileName()}' found`,
 					// Stashes should always come with files, so this should be fine (but protect it just in case)
-					filter: c => c.files?.some(f => f.path === path || f.originalPath === path) ?? true,
+					filter: c => c.anyFiles?.some(f => f.path === path || f.originalPath === path) ?? true,
 				},
 			);
 			if (pick == null) return;
@@ -62,19 +66,18 @@ export class DiffWithRevisionFromCommand extends ActiveEditorCommand {
 			sha = ref;
 		} else {
 			const title = `Open Changes with Branch or Tag${pad(GlyphChars.Dot, 2, 2)}`;
-			const pick = await ReferencePicker.show(
+			const pick = await showReferencePicker(
 				gitUri.repoPath,
 				`${title}${gitUri.getFormattedFileName({ truncateTo: quickPickTitleMaxChars - title.length })}`,
-				'Choose a branch or tag to compare with',
+				'Choose a reference (branch, tag, etc) to compare with',
 				{
-					allowEnteringRefs: true,
-					// checkmarks: false,
+					allowedAdditionalInput: { rev: true },
 				},
 			);
 			if (pick == null) return;
 
 			ref = pick.ref;
-			sha = GitReference.isBranch(pick) && pick.remote ? `remotes/${ref}` : ref;
+			sha = isBranchReference(pick) && pick.remote ? `remotes/${ref}` : ref;
 		}
 
 		if (ref == null) return;
@@ -83,27 +86,24 @@ export class DiffWithRevisionFromCommand extends ActiveEditorCommand {
 		let renamedTitle: string | undefined;
 
 		// Check to see if this file has been renamed
-		const files = await this.container.git.getDiffStatus(gitUri.repoPath, 'HEAD', ref, { filters: ['R', 'C'] });
+		const files = await svc.diff.getDiffStatus('HEAD', ref, { filters: ['R', 'C'] });
 		if (files != null) {
 			const rename = files.find(s => s.path === path);
 			if (rename?.originalPath != null) {
-				renamedUri = this.container.git.getAbsoluteUri(rename.originalPath, gitUri.repoPath);
-				renamedTitle = `${basename(rename.originalPath)} (${GitRevision.shorten(ref)})`;
+				renamedUri = svc.getAbsoluteUri(rename.originalPath, gitUri.repoPath);
+				renamedTitle = `${basename(rename.originalPath)} (${shortenRevision(ref)})`;
 			}
 		}
 
-		void (await executeCommand<DiffWithCommandArgs>(Commands.DiffWith, {
+		void (await executeCommand<DiffWithCommandArgs>('gitlens.diffWith', {
 			repoPath: gitUri.repoPath,
 			lhs: {
 				sha: sha,
 				uri: renamedUri ?? gitUri,
-				title: renamedTitle ?? `${basename(gitUri.fsPath)} (${GitRevision.shorten(ref)})`,
+				title: renamedTitle ?? `${basename(gitUri.fsPath)} (${shortenRevision(ref)})`,
 			},
-			rhs: {
-				sha: '',
-				uri: gitUri,
-			},
-			line: args.line,
+			rhs: { sha: '', uri: gitUri },
+			range: args.range,
 			showOptions: args.showOptions,
 		}));
 	}

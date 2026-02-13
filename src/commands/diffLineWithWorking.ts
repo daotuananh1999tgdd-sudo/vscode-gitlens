@@ -1,25 +1,38 @@
-import { TextDocumentShowOptions, TextEditor, Uri, window } from 'vscode';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { GitCommit, GitRevision } from '../git/models';
-import { Logger } from '../logger';
-import { Messages } from '../messages';
-import { command, executeCommand } from '../system/command';
-import { ActiveEditorCommand, getCommandUri } from './base';
-import { DiffWithCommandArgs } from './diffWith';
+import type { TextDocumentShowOptions, TextEditor, Uri } from 'vscode';
+import { window } from 'vscode';
+import type { Container } from '../container.js';
+import type { DiffRange } from '../git/gitProvider.js';
+import { GitUri } from '../git/gitUri.js';
+import type { GitCommit } from '../git/models/commit.js';
+import { uncommittedStaged } from '../git/models/revision.js';
+import { showFileNotUnderSourceControlWarningMessage, showGenericErrorMessage } from '../messages.js';
+import { command, executeCommand } from '../system/-webview/command.js';
+import { diffRangeToEditorLine, selectionToDiffRange } from '../system/-webview/vscode/editors.js';
+import { Logger } from '../system/logger.js';
+import { ActiveEditorCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
+import type { CommandContext } from './commandContext.js';
+import type { DiffWithCommandArgs } from './diffWith.js';
 
 export interface DiffLineWithWorkingCommandArgs {
 	commit?: GitCommit;
 
-	line?: number;
+	range?: DiffRange;
 	showOptions?: TextDocumentShowOptions;
 }
 
 @command()
 export class DiffLineWithWorkingCommand extends ActiveEditorCommand {
 	constructor(private readonly container: Container) {
-		super(Commands.DiffLineWithWorking);
+		super('gitlens.diffLineWithWorking');
+	}
+
+	protected override preExecute(context: CommandContext, args?: DiffLineWithWorkingCommandArgs): Promise<any> {
+		if (context.type === 'editorLine') {
+			args = { ...args, range: { startLine: context.line, endLine: context.line } };
+		}
+
+		return this.execute(context.editor, context.uri, args);
 	}
 
 	async execute(editor?: TextEditor, uri?: Uri, args?: DiffLineWithWorkingCommandArgs): Promise<any> {
@@ -29,21 +42,19 @@ export class DiffLineWithWorkingCommand extends ActiveEditorCommand {
 		const gitUri = await GitUri.fromUri(uri);
 
 		args = { ...args };
-		if (args.line == null) {
-			args.line = editor?.selection.active.line ?? 0;
-		}
+		args.range ??= selectionToDiffRange(editor?.selection);
 
 		let lhsSha: string;
 		let lhsUri: Uri;
 
 		if (args.commit == null || args.commit.isUncommitted) {
-			const blameline = args.line;
-			if (blameline < 0) return;
+			const blameEditorLine = diffRangeToEditorLine(args.range);
+			if (blameEditorLine < 0) return;
 
 			try {
-				const blame = await this.container.git.getBlameForLine(gitUri, blameline, editor?.document);
+				const blame = await this.container.git.getBlameForLine(gitUri, blameEditorLine, editor?.document);
 				if (blame == null) {
-					void Messages.showFileNotUnderSourceControlWarningMessage('Unable to open compare');
+					void showFileNotUnderSourceControlWarningMessage('Unable to open compare');
 
 					return;
 				}
@@ -52,13 +63,11 @@ export class DiffLineWithWorkingCommand extends ActiveEditorCommand {
 
 				// If the line is uncommitted, use previous commit (or index if the file is staged)
 				if (args.commit.isUncommitted) {
-					const status = await this.container.git.getStatusForFile(gitUri.repoPath!, gitUri);
+					const svc = this.container.git.getRepositoryService(gitUri.repoPath!);
+					const status = await svc.status.getStatusForFile?.(gitUri);
 					if (status?.indexStatus != null) {
-						lhsSha = GitRevision.uncommittedStaged;
-						lhsUri = this.container.git.getAbsoluteUri(
-							status.originalPath || status.path,
-							args.commit.repoPath,
-						);
+						lhsSha = uncommittedStaged;
+						lhsUri = svc.getAbsoluteUri(status.originalPath || status.path, args.commit.repoPath);
 					} else {
 						// Don't need to worry about verifying the previous sha, as the DiffWith command will
 						lhsSha = args.commit.unresolvedPreviousSha;
@@ -68,11 +77,10 @@ export class DiffLineWithWorkingCommand extends ActiveEditorCommand {
 					lhsSha = args.commit.sha;
 					lhsUri = args.commit.file!.uri;
 				}
-				// editor lines are 0-based
-				args.line = blame.line.line - 1;
+				args.range = { startLine: blame.line.line, endLine: blame.line.line };
 			} catch (ex) {
-				Logger.error(ex, 'DiffLineWithWorkingCommand', `getBlameForLine(${blameline})`);
-				void Messages.showGenericErrorMessage('Unable to open compare');
+				Logger.error(ex, 'DiffLineWithWorkingCommand', `getBlameForLine(${blameEditorLine})`);
+				void showGenericErrorMessage('Unable to open compare');
 
 				return;
 			}
@@ -88,17 +96,11 @@ export class DiffLineWithWorkingCommand extends ActiveEditorCommand {
 			return;
 		}
 
-		void (await executeCommand<DiffWithCommandArgs>(Commands.DiffWith, {
+		void (await executeCommand<DiffWithCommandArgs>('gitlens.diffWith', {
 			repoPath: args.commit.repoPath,
-			lhs: {
-				sha: lhsSha,
-				uri: lhsUri,
-			},
-			rhs: {
-				sha: '',
-				uri: workingUri,
-			},
-			line: args.line,
+			lhs: { sha: lhsSha, uri: lhsUri },
+			rhs: { sha: '', uri: workingUri },
+			range: args.range,
 			showOptions: args.showOptions,
 		}));
 	}

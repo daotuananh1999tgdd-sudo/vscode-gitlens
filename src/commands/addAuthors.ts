@@ -1,17 +1,16 @@
-import { SourceControl } from 'vscode';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { command } from '../system/command';
-import { Command } from './base';
-import { executeGitCommand } from './gitCommands.actions';
+import type { SourceControl } from 'vscode';
+import type { Container } from '../container.js';
+import { executeGitCommand } from '../git/actions.js';
+import { command } from '../system/-webview/command.js';
+import { GlCommandBase } from './commandBase.js';
 
 @command()
-export class AddAuthorsCommand extends Command {
+export class AddAuthorsCommand extends GlCommandBase {
 	constructor(private readonly container: Container) {
-		super(Commands.AddAuthors);
+		super('gitlens.addAuthors');
 	}
 
-	execute(sourceControl: SourceControl) {
+	execute(sourceControl: SourceControl): Promise<void> {
 		let repo;
 		if (sourceControl?.rootUri != null) {
 			repo = this.container.git.getRepository(sourceControl.rootUri);

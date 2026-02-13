@@ -1,11 +1,13 @@
-import { TextEditor, Uri } from 'vscode';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { GitReference } from '../git/models';
-import { command } from '../system/command';
-import { ActiveEditorCachedCommand, CommandContext, getCommandUri } from './base';
-import { executeGitCommand } from './gitCommands.actions';
+import type { TextEditor, Uri } from 'vscode';
+import type { Container } from '../container.js';
+import { executeGitCommand } from '../git/actions.js';
+import { GitUri } from '../git/gitUri.js';
+import type { GitReference } from '../git/models/reference.js';
+import { createReference } from '../git/utils/reference.utils.js';
+import { command } from '../system/-webview/command.js';
+import { ActiveEditorCachedCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
+import type { CommandContext } from './commandContext.js';
 
 export interface ShowQuickBranchHistoryCommandArgs {
 	repoPath?: string;
@@ -16,11 +18,11 @@ export interface ShowQuickBranchHistoryCommandArgs {
 @command()
 export class ShowQuickBranchHistoryCommand extends ActiveEditorCachedCommand {
 	constructor(private readonly container: Container) {
-		super([Commands.ShowQuickBranchHistory, Commands.ShowQuickCurrentBranchHistory]);
+		super(['gitlens.showQuickBranchHistory', 'gitlens.showQuickRepoHistory']);
 	}
 
-	protected override preExecute(context: CommandContext, args?: ShowQuickBranchHistoryCommandArgs) {
-		if (context.command === Commands.ShowQuickCurrentBranchHistory) {
+	protected override preExecute(context: CommandContext, args?: ShowQuickBranchHistoryCommandArgs): Promise<void> {
+		if (context.command === 'gitlens.showQuickRepoHistory') {
 			args = { ...args };
 			args.branch = 'HEAD';
 		}
@@ -28,7 +30,7 @@ export class ShowQuickBranchHistoryCommand extends ActiveEditorCachedCommand {
 		return this.execute(context.editor, context.uri, args);
 	}
 
-	async execute(editor?: TextEditor, uri?: Uri, args?: ShowQuickBranchHistoryCommandArgs) {
+	async execute(editor?: TextEditor, uri?: Uri, args?: ShowQuickBranchHistoryCommandArgs): Promise<void> {
 		uri = getCommandUri(uri, editor);
 
 		const gitUri = uri != null ? await GitUri.fromUri(uri) : undefined;
@@ -40,13 +42,13 @@ export class ShowQuickBranchHistoryCommand extends ActiveEditorCachedCommand {
 				ref =
 					args.branch === 'HEAD'
 						? 'HEAD'
-						: GitReference.create(args.branch, repoPath, {
+						: createReference(args.branch, repoPath, {
 								refType: 'branch',
 								name: args.branch,
 								remote: false,
-						  });
+							});
 			} else if (args?.tag != null) {
-				ref = GitReference.create(args.tag, repoPath, { refType: 'tag', name: args.tag });
+				ref = createReference(args.tag, repoPath, { refType: 'tag', name: args.tag });
 			}
 		}
 

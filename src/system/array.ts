@@ -1,5 +1,11 @@
-// eslint-disable-next-line no-restricted-imports
-export { findLastIndex, intersectionWith as intersection } from 'lodash-es';
+import { join } from './iterable.js';
+
+export function areEqual<T>(a: readonly T[] | undefined, b: readonly T[] | undefined): boolean {
+	if (a === b) return true;
+	if (a == null || b == null) return false;
+	if (a.length !== b.length) return false;
+	return a.every((value, index) => value === b[index]);
+}
 
 export function chunk<T>(source: T[], size: number): T[][] {
 	const chunks = [];
@@ -29,85 +35,53 @@ export function countUniques<T>(source: T[], accessor: (item: T) => string): Rec
 	return uniqueCounts;
 }
 
-export function ensure<T>(source: T | T[] | undefined): T[] | undefined {
+export function ensureArray<T>(source: NonNullable<T> | NonNullable<T>[]): T[];
+export function ensureArray<T>(source: NonNullable<T> | NonNullable<T>[] | undefined): NonNullable<T>[] | undefined;
+export function ensureArray<T>(source: NonNullable<T> | NonNullable<T>[] | undefined): NonNullable<T>[] | undefined {
 	return source == null ? undefined : Array.isArray(source) ? source : [source];
 }
 
 export function filterMap<T, TMapped>(
-	source: T[],
+	source: readonly T[],
 	predicateMapper: (item: T, index: number) => TMapped | null | undefined,
 ): TMapped[] {
 	let index = 0;
-	return source.reduce((accumulator, current) => {
+	return source.reduce<TMapped[]>((accumulator, current) => {
 		const mapped = predicateMapper(current, index++);
 		if (mapped != null) {
 			accumulator.push(mapped);
 		}
 		return accumulator;
-	}, [] as TMapped[]);
+	}, []);
 }
 
-export function filterMapAsync<T, TMapped>(
-	source: T[],
-	predicateMapper: (item: T, index: number) => Promise<TMapped | null | undefined>,
-): Promise<TMapped[]> {
-	let index = 0;
-	return source.reduce(async (accumulator, current) => {
-		const mapped = await predicateMapper(current, index++);
-		if (mapped != null) {
-			accumulator.push(mapped);
+export function findLastIndex<T>(source: T[], predicate: (value: T, index: number, obj: T[]) => boolean): number {
+	let l = source.length;
+	while (l--) {
+		if (predicate(source[l], l, source)) return l;
+	}
+	return -1;
+}
+
+export function intersection<T>(sources: T[][], comparator: (a: T, b: T) => boolean): T[] {
+	const results: T[] = [];
+
+	const length = sources.length;
+	outer: for (const item of sources[0]) {
+		let i = length - 1;
+		while (i--) {
+			if (!sources[i + 1].some(v => comparator(v, item))) break outer;
 		}
-		return accumulator;
-	}, [] as any);
-}
 
-export function groupBy<T>(source: T[], groupingKey: (item: T) => string): Record<string, T[]> {
-	return source.reduce((groupings, current) => {
-		const value = groupingKey(current);
-		const group = groupings[value];
-		if (group === undefined) {
-			groupings[value] = [current];
-		} else {
-			group.push(current);
+		if (!results.some(v => comparator(v, item))) {
+			results.push(item);
 		}
-		return groupings;
-	}, Object.create(null) as Record<string, T[]>);
+	}
+
+	return results;
 }
 
-export function groupByMap<TKey, TValue>(source: TValue[], groupingKey: (item: TValue) => TKey): Map<TKey, TValue[]> {
-	return source.reduce((groupings, current) => {
-		const value = groupingKey(current);
-		const group = groupings.get(value);
-		if (group === undefined) {
-			groupings.set(value, [current]);
-		} else {
-			group.push(current);
-		}
-		return groupings;
-	}, new Map<TKey, TValue[]>());
-}
-
-export function groupByFilterMap<TKey, TValue, TMapped>(
-	source: TValue[],
-	groupingKey: (item: TValue) => TKey,
-	predicateMapper: (item: TValue) => TMapped | null | undefined,
-): Map<TKey, TMapped[]> {
-	return source.reduce((groupings, current) => {
-		const mapped = predicateMapper(current);
-		if (mapped != null) {
-			const value = groupingKey(current);
-			const group = groupings.get(value);
-			if (group === undefined) {
-				groupings.set(value, [mapped]);
-			} else {
-				group.push(mapped);
-			}
-		}
-		return groupings;
-	}, new Map<TKey, TMapped[]>());
-}
-
-export function isStringArray<T extends any[]>(array: string[] | T): array is string[] {
+export function isStringArray<T extends any[]>(array: readonly string[] | T): array is string[] {
 	return typeof array[0] === 'string';
 }
 
@@ -128,12 +102,7 @@ export function makeHierarchical<T>(
 	compact: boolean = false,
 	canCompact?: (i: T) => boolean,
 ): HierarchicalItem<T> {
-	const seed = {
-		name: '',
-		relativePath: '',
-		children: new Map(),
-		descendants: [],
-	};
+	const seed = { name: '', relativePath: '', children: new Map(), descendants: [] };
 
 	let hierarchy = values.reduce((root: HierarchicalItem<T>, value) => {
 		let folder = root;
@@ -142,12 +111,9 @@ export function makeHierarchical<T>(
 		for (const folderName of splitPath(value)) {
 			relativePath = joinPath(relativePath, folderName);
 
-			if (folder.children === undefined) {
-				folder.children = new Map();
-			}
-
+			folder.children ??= new Map();
 			let f = folder.children.get(folderName);
-			if (f === undefined) {
+			if (f == null) {
 				f = {
 					name: folderName,
 					relativePath: relativePath,
@@ -158,9 +124,7 @@ export function makeHierarchical<T>(
 				folder.children.set(folderName, f);
 			}
 
-			if (folder.descendants === undefined) {
-				folder.descendants = [];
-			}
+			folder.descendants ??= [];
 			folder.descendants.push(value);
 			folder = f;
 		}
@@ -183,44 +147,42 @@ export function compactHierarchy<T>(
 	isRoot: boolean = true,
 	canCompact?: (i: T) => boolean,
 ): HierarchicalItem<T> {
-	if (root.children === undefined) return root;
+	if (root.children == null) return root;
 
 	const children = [...root.children.values()];
 	for (const child of children) {
 		compactHierarchy(child, joinPath, false, canCompact);
 	}
 
-	if (!isRoot && children.length === 1) {
+	if (!isRoot && root.value == null && children.length === 1) {
 		const child = children[0];
-		if (child.value === undefined || canCompact?.(child.value)) {
+		if (child.value == null || canCompact?.(child.value)) {
 			root.name = joinPath(root.name, child.name);
 			root.relativePath = child.relativePath;
 			root.children = child.children;
 			root.descendants = child.descendants;
 			root.value = child.value;
+
+			// Update the parent pointer for the new children if they exist
+			if (root.children != null) {
+				for (const grandChild of root.children.values()) {
+					grandChild.parent = root;
+				}
+			}
 		}
 	}
 
 	return root;
 }
 
-export function uniqueBy<TKey, TValue>(
-	source: TValue[],
-	uniqueKey: (item: TValue) => TKey,
-	onDuplicate: (original: TValue, current: TValue) => TValue | void,
-): TValue[] {
-	const map = source.reduce((uniques, current) => {
-		const value = uniqueKey(current);
-		const original = uniques.get(value);
-		if (original === undefined) {
-			uniques.set(value, current);
-		} else {
-			const updated = onDuplicate(original, current);
-			if (updated !== undefined) {
-				uniques.set(value, updated);
-			}
-		}
-		return uniques;
-	}, new Map<TKey, TValue>());
-	return [...map.values()];
+export function unique<T>(source: readonly T[]): T[] {
+	return [...new Set(source)];
+}
+
+export function joinUnique<T>(source: readonly T[], separator: string): string {
+	return join(new Set(source), separator);
+}
+
+export function splitAt<T>(source: T[], index: number): [T[], T[]] {
+	return index < 0 ? [source, []] : [source.slice(0, index), source.slice(index)];
 }

@@ -1,15 +1,12 @@
-import { GitActions } from '../commands/gitCommands.actions';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { GitStashCommit, GitStashReference } from '../git/models';
-import { CommandQuickPickItem } from '../quickpicks/items/common';
-import { command } from '../system/command';
-import {
-	Command,
-	CommandContext,
-	isCommandContextViewNodeHasCommit,
-	isCommandContextViewNodeHasRepository,
-} from './base';
+import type { Container } from '../container.js';
+import { apply, pop } from '../git/actions/stash.js';
+import type { GitStashCommit } from '../git/models/commit.js';
+import type { GitStashReference } from '../git/models/reference.js';
+import type { CommandQuickPickItem } from '../quickpicks/items/common.js';
+import { command } from '../system/-webview/command.js';
+import { GlCommandBase } from './commandBase.js';
+import type { CommandContext } from './commandContext.js';
+import { isCommandContextViewNodeHasCommit, isCommandContextViewNodeHasRepository } from './commandContext.utils.js';
 
 export interface StashApplyCommandArgs {
 	deleteAfter?: boolean;
@@ -20,29 +17,31 @@ export interface StashApplyCommandArgs {
 }
 
 @command()
-export class StashApplyCommand extends Command {
+export class StashApplyCommand extends GlCommandBase {
 	constructor(private readonly container: Container) {
-		super(Commands.StashApply);
+		super(['gitlens.stashesApply', 'gitlens.stashesApply:views']);
 	}
 
-	protected override async preExecute(context: CommandContext, args?: StashApplyCommandArgs) {
-		if (isCommandContextViewNodeHasCommit<GitStashCommit>(context)) {
-			if (context.node.commit.message == null) {
-				await context.node.commit.ensureFullDetails();
+	protected override async preExecute(context: CommandContext, args?: StashApplyCommandArgs): Promise<void> {
+		if (context.command === 'gitlens.stashesApply:views') {
+			if (isCommandContextViewNodeHasCommit<GitStashCommit>(context)) {
+				if (context.node.commit.message == null) {
+					await context.node.commit.ensureFullDetails();
+				}
+				args = { ...args, stashItem: context.node.commit };
+			} else if (isCommandContextViewNodeHasRepository(context)) {
+				args = { ...args, repoPath: context.node.repo.path };
 			}
-			args = { ...args, stashItem: context.node.commit };
-		} else if (isCommandContextViewNodeHasRepository(context)) {
-			args = { ...args, repoPath: context.node.repo.path };
 		}
 
 		return this.execute(args);
 	}
 
-	async execute(args?: StashApplyCommandArgs) {
+	async execute(args?: StashApplyCommandArgs): Promise<void> {
 		if (args?.deleteAfter) {
-			return GitActions.Stash.pop(args?.repoPath ?? args?.stashItem?.repoPath, args?.stashItem);
+			return pop(args?.repoPath ?? args?.stashItem?.repoPath, args?.stashItem);
 		}
 
-		return GitActions.Stash.apply(args?.repoPath ?? args?.stashItem?.repoPath, args?.stashItem);
+		return apply(args?.repoPath ?? args?.stashItem?.repoPath, args?.stashItem);
 	}
 }
