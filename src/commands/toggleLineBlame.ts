@@ -1,24 +1,22 @@
-import { TextEditor, Uri, window } from 'vscode';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { Logger } from '../logger';
-import { command } from '../system/command';
-import { ActiveEditorCommand } from './base';
+import type { TextEditor, Uri } from 'vscode';
+import type { Container } from '../container.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { command } from '../system/-webview/command.js';
+import { Logger } from '../system/logger.js';
+import { ActiveEditorCommand } from './commandBase.js';
 
 @command()
 export class ToggleLineBlameCommand extends ActiveEditorCommand {
 	constructor(private readonly container: Container) {
-		super(Commands.ToggleLineBlame);
+		super('gitlens.toggleLineBlame');
 	}
 
 	async execute(editor: TextEditor, _uri?: Uri): Promise<void> {
 		try {
-			void (await this.container.lineAnnotations.toggle(editor));
+			await this.container.lineAnnotations.toggle(editor);
 		} catch (ex) {
 			Logger.error(ex, 'ToggleLineBlameCommand');
-			void window.showErrorMessage(
-				'Unable to toggle line blame annotations. See output channel for more details',
-			);
+			void showGenericErrorMessage('Unable to toggle line blame annotations');
 		}
 	}
 }

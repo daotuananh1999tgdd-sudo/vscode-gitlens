@@ -1,37 +1,56 @@
-import { Command, TreeItem, TreeItemCollapsibleState } from 'vscode';
-import type { DiffWithCommandArgs } from '../../commands';
-import { Commands } from '../../constants';
-import { StatusFileFormatter } from '../../git/formatters';
-import { GitUri } from '../../git/gitUri';
-import { GitFile, GitReference, GitRevisionReference } from '../../git/models';
-import { joinPaths, relativeDir } from '../../system/path';
-import { View } from '../viewBase';
-import { FileNode } from './folderNode';
-import { ContextValues, ViewNode, ViewRefFileNode } from './viewNode';
+import type { Command } from 'vscode';
+import { TreeItem, TreeItemCheckboxState, TreeItemCollapsibleState } from 'vscode';
+import type { DiffWithCommandArgs } from '../../commands/diffWith.js';
+import { StatusFileFormatter } from '../../git/formatters/statusFormatter.js';
+import { GitUri } from '../../git/gitUri.js';
+import type { GitFile } from '../../git/models/file.js';
+import type { GitRevisionReference } from '../../git/models/reference.js';
+import { getGitFileStatusIcon } from '../../git/utils/fileStatus.utils.js';
+import { createReference } from '../../git/utils/reference.utils.js';
+import { createCommand } from '../../system/-webview/command.js';
+import { relativeDir } from '../../system/-webview/path.js';
+import { editorLineToDiffRange } from '../../system/-webview/vscode/editors.js';
+import { joinPaths } from '../../system/path.js';
+import type { View } from '../viewBase.js';
+import { getFileTooltipMarkdown } from './abstract/viewFileNode.js';
+import type { ViewNode } from './abstract/viewNode.js';
+import { ContextValues, getViewNodeId } from './abstract/viewNode.js';
+import { ViewRefFileNode } from './abstract/viewRefNode.js';
+import { getComparisonStoragePrefix } from './compareResultsNode.js';
+import type { FileNode } from './folderNode.js';
 
-export class ResultsFileNode extends ViewRefFileNode implements FileNode {
+type State = {
+	checked: TreeItemCheckboxState;
+};
+
+export class ResultsFileNode extends ViewRefFileNode<'results-file', View, State> implements FileNode {
 	constructor(
 		view: View,
 		parent: ViewNode,
 		repoPath: string,
-		public readonly file: GitFile,
+		file: GitFile,
 		public readonly ref1: string,
 		public readonly ref2: string,
 		private readonly direction: 'ahead' | 'behind' | undefined,
 	) {
-		super(GitUri.fromFile(file, repoPath, ref1 || ref2), view, parent);
+		super('results-file', GitUri.fromFile(file, repoPath, ref1 || ref2), view, parent, file);
+
+		this.updateContext({ file: file });
+		if (this.context.storedComparisonId != null) {
+			this._uniqueId = `${getComparisonStoragePrefix(this.context.storedComparisonId)}${this.direction}|${
+				file.path
+			}`;
+		} else {
+			this._uniqueId = getViewNodeId(this.type, this.context);
+		}
 	}
 
 	override toClipboard(): string {
-		return this.fileName;
-	}
-
-	get fileName(): string {
 		return this.file.path;
 	}
 
 	get ref(): GitRevisionReference {
-		return GitReference.create(this.ref1 || this.ref2, this.uri.repoPath!);
+		return createReference(this.ref1 || this.ref2, this.uri.repoPath!);
 	}
 
 	getChildren(): ViewNode[] {
@@ -42,23 +61,26 @@ export class ResultsFileNode extends ViewRefFileNode implements FileNode {
 		const item = new TreeItem(this.label, TreeItemCollapsibleState.None);
 		item.contextValue = ContextValues.ResultsFile;
 		item.description = this.description;
-		item.tooltip = StatusFileFormatter.fromTemplate(
-			`\${file}\n\${directory}/\n\n\${status}\${ (originalPath)}`,
-			this.file,
-		);
+		item.tooltip = getFileTooltipMarkdown(this.file);
 
-		const statusIcon = GitFile.getStatusIcon(this.file.status);
+		const statusIcon = getGitFileStatusIcon(this.file.status);
 		item.iconPath = {
 			dark: this.view.container.context.asAbsolutePath(joinPaths('images', 'dark', statusIcon)),
 			light: this.view.container.context.asAbsolutePath(joinPaths('images', 'light', statusIcon)),
 		};
 
 		item.command = this.getCommand();
+
+		item.checkboxState = {
+			state: this.getState('checked') ?? TreeItemCheckboxState.Unchecked,
+			tooltip: 'Mark as Reviewed',
+		};
+
 		return item;
 	}
 
 	private _description: string | undefined;
-	get description() {
+	get description(): string {
 		if (this._description === undefined) {
 			this._description = StatusFileFormatter.fromTemplate(
 				this.view.config.formats.files.description,
@@ -72,7 +94,7 @@ export class ResultsFileNode extends ViewRefFileNode implements FileNode {
 	}
 
 	private _folderName: string | undefined;
-	get folderName() {
+	get folderName(): string {
 		if (this._folderName === undefined) {
 			this._folderName = relativeDir(this.uri.relativePath);
 		}
@@ -80,13 +102,17 @@ export class ResultsFileNode extends ViewRefFileNode implements FileNode {
 	}
 
 	private _label: string | undefined;
-	get label() {
+	get label(): string {
 		if (this._label === undefined) {
 			this._label = StatusFileFormatter.fromTemplate(this.view.config.formats.files.label, this.file, {
 				relativePath: this.relativePath,
 			});
 		}
 		return this._label;
+	}
+
+	get priority(): number {
+		return 0;
 	}
 
 	private _relativePath: string | undefined;
@@ -99,38 +125,33 @@ export class ResultsFileNode extends ViewRefFileNode implements FileNode {
 		this._description = undefined;
 	}
 
-	get priority(): number {
-		return 0;
-	}
-
 	override getCommand(): Command | undefined {
-		const commandArgs: DiffWithCommandArgs = {
-			lhs: {
-				sha: this.ref1,
-				uri:
-					(this.file.status === 'R' || this.file.status === 'C') && this.direction === 'behind'
-						? GitUri.fromFile(this.file, this.uri.repoPath!, this.ref2, true)
-						: this.uri,
-			},
-			rhs: {
-				sha: this.ref2,
-				uri:
-					(this.file.status === 'R' || this.file.status === 'C') && this.direction !== 'behind'
-						? GitUri.fromFile(this.file, this.uri.repoPath!, this.ref2, true)
-						: this.uri,
-			},
+		let lhsUri;
+		let rhsUri;
+		if (this.file.status === 'R' || this.file.status === 'C') {
+			if (this.direction === 'behind') {
+				lhsUri = GitUri.fromFile(this.file, this.uri.repoPath!, this.ref2, true);
+				rhsUri = this.uri;
+			} else if (this.direction == null) {
+				lhsUri = GitUri.fromFile(this.file, this.uri.repoPath!, this.ref1, true);
+				rhsUri = GitUri.fromFile(this.file, this.uri.repoPath!, this.ref2, false);
+			} else {
+				lhsUri = this.uri;
+				rhsUri = GitUri.fromFile(this.file, this.uri.repoPath!, this.ref2, true);
+			}
+		} else {
+			lhsUri = this.uri;
+			rhsUri = this.uri;
+		}
+
+		return createCommand<[DiffWithCommandArgs]>('gitlens.diffWith', 'Open Changes', {
+			lhs: { sha: this.ref1, uri: lhsUri },
+			rhs: { sha: this.ref2, uri: rhsUri },
 			repoPath: this.uri.repoPath!,
 
-			line: 0,
-			showOptions: {
-				preserveFocus: true,
-				preview: true,
-			},
-		};
-		return {
-			title: 'Open Changes',
-			command: Commands.DiffWith,
-			arguments: [commandArgs],
-		};
+			fromComparison: true,
+			range: editorLineToDiffRange(0),
+			showOptions: { preserveFocus: true, preview: true },
+		});
 	}
 }

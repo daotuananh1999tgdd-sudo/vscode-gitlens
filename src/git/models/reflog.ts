@@ -1,8 +1,8 @@
-import { DateStyle } from '../../config';
-import { Container } from '../../container';
-import { formatDate, fromNow } from '../../system/date';
-import { memoize } from '../../system/decorators/memoize';
-import { GitRevision } from './reference';
+import type { Container } from '../../container.js';
+import { formatDate, fromNow } from '../../system/date.js';
+import { loggable } from '../../system/decorators/log.js';
+import { memoize } from '../../system/decorators/memoize.js';
+import { shortenRevision } from '../utils/revision.utils.js';
 
 export interface GitReflog {
 	readonly repoPath: string;
@@ -15,10 +15,12 @@ export interface GitReflog {
 	more?(limit: number | undefined): Promise<GitReflog | undefined>;
 }
 
+@loggable(i => `${shortenRevision(i.sha)}|${i.command}`)
 export class GitReflogRecord {
 	private _previousSha: string | undefined;
 
 	constructor(
+		private readonly container: Container,
 		public readonly repoPath: string,
 		public readonly sha: string,
 		private _selector: string,
@@ -28,55 +30,55 @@ export class GitReflogRecord {
 		public readonly details: string | undefined,
 	) {}
 
-	@memoize<GitReflogRecord['formatDate']>(format => format ?? 'MMMM Do, YYYY h:mma')
-	formatDate(format?: string | null) {
+	@memoize<GitReflogRecord['formatDate']>({ resolver: format => format ?? 'MMMM Do, YYYY h:mma' })
+	formatDate(format?: string | null): string {
 		return formatDate(this.date, format ?? 'MMMM Do, YYYY h:mma');
 	}
 
-	formatDateFromNow() {
+	formatDateFromNow(): string {
 		return fromNow(this.date);
 	}
 
 	get formattedDate(): string {
-		return Container.instance.CommitDateFormatting.dateStyle === DateStyle.Absolute
-			? this.formatDate(Container.instance.CommitDateFormatting.dateFormat)
+		return this.container.CommitDateFormatting.dateStyle === 'absolute'
+			? this.formatDate(this.container.CommitDateFormatting.dateFormat)
 			: this.formatDateFromNow();
 	}
 
 	@memoize()
-	get HEAD() {
+	get HEAD(): string {
 		if (this._selector == null || this._selector.length === 0) return '';
 
 		if (this._selector.startsWith('refs/heads')) {
-			return this._selector.substr(11);
+			return this._selector.substring(11);
 		}
 
 		if (this._selector.startsWith('refs/remotes')) {
-			return this._selector.substr(13);
+			return this._selector.substring(13);
 		}
 
 		return this._selector;
 	}
 
-	get previousSha() {
+	get previousSha(): string | undefined {
 		return this._previousSha;
 	}
 
 	@memoize()
-	get previousShortSha() {
-		return GitRevision.shorten(this._previousSha);
+	get previousShortSha(): string {
+		return shortenRevision(this._previousSha);
 	}
 
-	get selector() {
+	get selector(): string {
 		return this._selector;
 	}
 
 	@memoize()
-	get shortSha() {
-		return GitRevision.shorten(this.sha);
+	get shortSha(): string {
+		return shortenRevision(this.sha);
 	}
 
-	update(previousSha?: string, selector?: string) {
+	update(previousSha?: string, selector?: string): void {
 		if (previousSha !== undefined) {
 			this._previousSha = previousSha;
 		}

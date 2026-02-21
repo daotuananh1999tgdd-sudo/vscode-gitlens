@@ -1,29 +1,28 @@
 import { ThemeIcon, TreeItem, TreeItemCollapsibleState } from 'vscode';
-import { GitUri } from '../../git/gitUri';
-import { Repository } from '../../git/models';
-import { gate } from '../../system/decorators/gate';
-import { debug } from '../../system/decorators/log';
-import { RemotesView } from '../remotesView';
-import { RepositoriesView } from '../repositoriesView';
-import { MessageNode } from './common';
-import { RemoteNode } from './remoteNode';
-import { RepositoryNode } from './repositoryNode';
-import { ContextValues, ViewNode } from './viewNode';
+import type { GitUri } from '../../git/gitUri.js';
+import type { Repository } from '../../git/models/repository.js';
+import type { ViewsWithRemotesNode } from '../viewBase.js';
+import { CacheableChildrenViewNode } from './abstract/cacheableChildrenViewNode.js';
+import type { ViewNode } from './abstract/viewNode.js';
+import { ContextValues, getViewNodeId } from './abstract/viewNode.js';
+import { MessageNode } from './common.js';
+import { RemoteNode } from './remoteNode.js';
 
-export class RemotesNode extends ViewNode<RemotesView | RepositoriesView> {
-	static key = ':remotes';
-	static getId(repoPath: string): string {
-		return `${RepositoryNode.getId(repoPath)}${this.key}`;
-	}
+export class RemotesNode extends CacheableChildrenViewNode<'remotes', ViewsWithRemotesNode> {
+	constructor(
+		uri: GitUri,
+		view: ViewsWithRemotesNode,
+		protected override readonly parent: ViewNode,
+		public readonly repo: Repository,
+	) {
+		super('remotes', uri, view, parent);
 
-	private _children: ViewNode[] | undefined;
-
-	constructor(uri: GitUri, view: RemotesView | RepositoriesView, parent: ViewNode, public readonly repo: Repository) {
-		super(uri, view, parent);
+		this.updateContext({ repository: repo });
+		this._uniqueId = getViewNodeId(this.type, this.context);
 	}
 
 	override get id(): string {
-		return RemotesNode.getId(this.repo.path);
+		return this._uniqueId;
 	}
 
 	get repoPath(): string {
@@ -31,16 +30,19 @@ export class RemotesNode extends ViewNode<RemotesView | RepositoriesView> {
 	}
 
 	async getChildren(): Promise<ViewNode[]> {
-		if (this._children == null) {
-			const remotes = await this.repo.getRemotes({ sort: true });
-			if (remotes.length === 0) {
+		if (this.children == null) {
+			const remotes = await this.repo.git.remotes.getRemotes({ sort: true });
+			if (!remotes.length) {
 				return [new MessageNode(this.view, this, 'No remotes could be found')];
 			}
 
-			this._children = remotes.map(r => new RemoteNode(this.uri, this.view, this, r, this.repo));
+			const expand = remotes.length === 1;
+			this.children = remotes.map(
+				r => new RemoteNode(this.uri, this.view, this, this.repo, r, { expand: expand }),
+			);
 		}
 
-		return this._children;
+		return this.children;
 	}
 
 	getTreeItem(): TreeItem {
@@ -50,11 +52,5 @@ export class RemotesNode extends ViewNode<RemotesView | RepositoriesView> {
 		item.iconPath = new ThemeIcon('cloud');
 
 		return item;
-	}
-
-	@gate()
-	@debug()
-	override refresh() {
-		this._children = undefined;
 	}
 }

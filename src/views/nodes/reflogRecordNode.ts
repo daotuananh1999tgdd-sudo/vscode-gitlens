@@ -1,44 +1,34 @@
 import { TreeItem, TreeItemCollapsibleState, window } from 'vscode';
-import { GlyphChars } from '../../constants';
-import { GitUri } from '../../git/gitUri';
-import { GitLog, GitReflogRecord } from '../../git/models';
-import { gate } from '../../system/decorators/gate';
-import { debug } from '../../system/decorators/log';
-import { map } from '../../system/iterable';
-import { ViewsWithCommits } from '../viewBase';
-import { CommitNode } from './commitNode';
-import { LoadMoreNode, MessageNode } from './common';
-import { RepositoryNode } from './repositoryNode';
-import { ContextValues, PageableViewNode, ViewNode } from './viewNode';
+import { GlyphChars } from '../../constants.js';
+import { GitUri } from '../../git/gitUri.js';
+import type { GitLog } from '../../git/models/log.js';
+import type { GitReflogRecord } from '../../git/models/reflog.js';
+import { gate } from '../../system/decorators/gate.js';
+import { trace } from '../../system/decorators/log.js';
+import { map } from '../../system/iterable.js';
+import type { ViewsWithCommits } from '../viewBase.js';
+import type { PageableViewNode } from './abstract/viewNode.js';
+import { ContextValues, getViewNodeId, ViewNode } from './abstract/viewNode.js';
+import { CommitNode } from './commitNode.js';
+import { LoadMoreNode, MessageNode } from './common.js';
 
-export class ReflogRecordNode extends ViewNode<ViewsWithCommits> implements PageableViewNode {
-	static key = ':reflog-record';
-	static getId(
-		repoPath: string,
-		sha: string,
-		selector: string,
-		command: string,
-		commandArgs: string | undefined,
-		date: Date,
-	): string {
-		return `${RepositoryNode.getId(repoPath)}${this.key}(${sha}|${selector}|${command}|${
-			commandArgs ?? ''
-		}|${date.getTime()})`;
-	}
+export class ReflogRecordNode extends ViewNode<'reflog-record', ViewsWithCommits> implements PageableViewNode {
+	limit: number | undefined;
 
-	constructor(view: ViewsWithCommits, parent: ViewNode, public readonly record: GitReflogRecord) {
-		super(GitUri.fromRepoPath(record.repoPath), view, parent);
+	constructor(
+		view: ViewsWithCommits,
+		parent: ViewNode,
+		public readonly record: GitReflogRecord,
+	) {
+		super('reflog-record', GitUri.fromRepoPath(record.repoPath), view, parent);
+
+		this.updateContext({ reflog: record });
+		this._uniqueId = getViewNodeId(this.type, this.context);
+		this.limit = this.view.getNodeLastKnownLimit(this);
 	}
 
 	override get id(): string {
-		return ReflogRecordNode.getId(
-			this.uri.repoPath!,
-			this.record.sha,
-			this.record.selector,
-			this.record.command,
-			this.record.commandArgs,
-			this.record.date,
-		);
+		return this._uniqueId;
 	}
 
 	async getChildren(): Promise<ViewNode[]> {
@@ -50,7 +40,7 @@ export class ReflogRecordNode extends ViewNode<ViewsWithCommits> implements Page
 		];
 
 		if (log.hasMore) {
-			children.push(new LoadMoreNode(this.view, this, children[children.length - 1]));
+			children.push(new LoadMoreNode(this.view, this, children.at(-1)!));
 		}
 		return children;
 	}
@@ -78,9 +68,8 @@ export class ReflogRecordNode extends ViewNode<ViewsWithCommits> implements Page
 		return item;
 	}
 
-	@gate()
-	@debug()
-	override refresh(reset?: boolean) {
+	@trace()
+	override refresh(reset?: boolean): void {
 		if (reset) {
 			this._log = undefined;
 		}
@@ -90,29 +79,27 @@ export class ReflogRecordNode extends ViewNode<ViewsWithCommits> implements Page
 	private async getLog() {
 		if (this._log === undefined) {
 			const range = `${this.record.previousSha}..${this.record.sha}`;
-			this._log = await this.view.container.git.getLog(this.uri.repoPath!, {
+			this._log = await this.view.container.git.getRepositoryService(this.uri.repoPath!).commits.getLog(range, {
 				limit: this.limit ?? this.view.config.defaultItemLimit,
-				ref: range,
 			});
 		}
 
 		return this._log;
 	}
 
-	get hasMore() {
+	get hasMore(): boolean {
 		return this._log?.hasMore ?? true;
 	}
 
-	limit: number | undefined = this.view.getNodeLastKnownLimit(this);
 	@gate()
-	async loadMore(limit?: number | { until?: any }) {
+	async loadMore(limit?: number | { until?: any }): Promise<void> {
 		let log = await window.withProgress(
 			{
 				location: { viewId: this.view.id },
 			},
 			() => this.getLog(),
 		);
-		if (log === undefined || !log.hasMore) return;
+		if (!log?.hasMore) return;
 
 		log = await log.more?.(limit ?? this.view.config.pageItemLimit);
 		if (this._log === log) return;

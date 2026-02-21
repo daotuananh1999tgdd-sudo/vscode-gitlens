@@ -1,39 +1,36 @@
 import { ConfigurationTarget } from 'vscode';
-import { configuration } from '../configuration';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { Logger } from '../logger';
-import { ModePicker } from '../quickpicks/modePicker';
-import { command } from '../system/command';
-import { log } from '../system/decorators/log';
-import { Command } from './base';
+import type { Container } from '../container.js';
+import { showModePicker } from '../quickpicks/modePicker.js';
+import { command } from '../system/-webview/command.js';
+import { configuration } from '../system/-webview/configuration.js';
+import { debug } from '../system/decorators/log.js';
+import { getScopedLogger } from '../system/logger.scope.js';
+import { GlCommandBase } from './commandBase.js';
 
 @command()
-export class SwitchModeCommand extends Command {
+export class SwitchModeCommand extends GlCommandBase {
 	constructor(private readonly container: Container) {
-		super(Commands.SwitchMode);
+		super('gitlens.switchMode');
 	}
 
-	@log({ args: false, correlate: true, singleLine: true, timed: false })
-	async execute() {
-		const cc = Logger.getCorrelationContext();
+	@debug({ args: false, onlyExit: true, timing: false })
+	async execute(): Promise<void> {
+		const scope = getScopedLogger();
 
-		const pick = await ModePicker.show();
+		const pick = await showModePicker();
 		if (pick === undefined) return;
 
-		if (cc != null) {
-			cc.exitDetails = ` \u2014 mode=${pick.key ?? ''}`;
-		}
+		scope?.addExitInfo(`mode=${pick.key ?? ''}`);
 
-		const active = this.container.config.mode.active;
+		const active = configuration.get('mode.active');
 		if (active === pick.key) return;
 
 		// Check if we have applied any annotations and clear them if we won't be applying them again
 		if (active != null && active.length !== 0) {
-			const activeAnnotations = this.container.config.modes?.[active].annotations;
+			const modes = configuration.get('modes');
+			const activeAnnotations = modes?.[active].annotations;
 			if (activeAnnotations != null) {
-				const newAnnotations =
-					pick.key != null ? this.container.config.modes?.[pick.key].annotations : undefined;
+				const newAnnotations = pick.key != null ? modes?.[pick.key].annotations : undefined;
 				if (activeAnnotations !== newAnnotations) {
 					await this.container.fileAnnotations.clearAll();
 				}
@@ -45,35 +42,33 @@ export class SwitchModeCommand extends Command {
 }
 
 @command()
-export class ToggleReviewModeCommand extends Command {
+export class ToggleReviewModeCommand extends GlCommandBase {
 	constructor(private readonly container: Container) {
-		super(Commands.ToggleReviewMode);
+		super('gitlens.toggleReviewMode');
 	}
 
-	@log({ args: false, singleLine: true, timed: false })
-	async execute() {
-		if (this.container.config.modes == null || !Object.keys(this.container.config.modes).includes('review')) {
-			return;
-		}
+	@debug({ args: false, onlyExit: true, timing: false })
+	async execute(): Promise<void> {
+		const modes = configuration.get('modes');
+		if (modes == null || !Object.keys(modes).includes('review')) return;
 
-		const mode = this.container.config.mode.active === 'review' ? undefined : 'review';
+		const mode = configuration.get('mode.active') === 'review' ? undefined : 'review';
 		await configuration.update('mode.active', mode, ConfigurationTarget.Global);
 	}
 }
 
 @command()
-export class ToggleZenModeCommand extends Command {
+export class ToggleZenModeCommand extends GlCommandBase {
 	constructor(private readonly container: Container) {
-		super(Commands.ToggleZenMode);
+		super('gitlens.toggleZenMode');
 	}
 
-	@log({ args: false, singleLine: true, timed: false })
-	async execute() {
-		if (this.container.config.modes == null || !Object.keys(this.container.config.modes).includes('zen')) {
-			return;
-		}
+	@debug({ args: false, onlyExit: true, timing: false })
+	async execute(): Promise<void> {
+		const modes = configuration.get('modes');
+		if (modes == null || !Object.keys(modes).includes('zen')) return;
 
-		const mode = this.container.config.mode.active === 'zen' ? undefined : 'zen';
+		const mode = configuration.get('mode.active') === 'zen' ? undefined : 'zen';
 		await configuration.update('mode.active', mode, ConfigurationTarget.Global);
 	}
 }

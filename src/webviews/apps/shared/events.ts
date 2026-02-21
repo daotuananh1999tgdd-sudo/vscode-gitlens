@@ -2,14 +2,12 @@ export interface Disposable {
 	dispose(): void;
 }
 
-export interface Event<T> {
-	(listener: (e: T) => any, thisArgs?: any, disposables?: Disposable[]): Disposable;
-}
+export type Event<T> = (listener: (e: T) => unknown, thisArgs?: unknown, disposables?: Disposable[]) => Disposable;
 
-type Listener<T> = [(e: T) => void, any] | ((e: T) => void);
+type Listener<T> = [(e: T) => void, unknown] | ((e: T) => void);
 
 export class Emitter<T> {
-	private static readonly _noop = function () {
+	private static readonly _noop = function (this: void) {
 		/* noop */
 	};
 
@@ -23,30 +21,26 @@ export class Emitter<T> {
 	 * to events from this Emitter
 	 */
 	get event(): Event<T> {
-		if (this._event == null) {
-			this._event = (listener: (e: T) => any, thisArgs?: any, disposables?: Disposable[]) => {
-				if (this.listeners == null) {
-					this.listeners = new LinkedList();
-				}
+		this._event ??= (listener: (e: T) => unknown, thisArgs?: unknown, disposables?: Disposable[]) => {
+			this.listeners ??= new LinkedList();
 
-				const remove = this.listeners.push(thisArgs == null ? listener : [listener, thisArgs]);
+			const remove = this.listeners.push(thisArgs == null ? listener : [listener, thisArgs]);
 
-				const result = {
-					dispose: () => {
-						result.dispose = Emitter._noop;
-						if (!this._disposed) {
-							remove();
-						}
-					},
-				};
-
-				if (Array.isArray(disposables)) {
-					disposables.push(result);
-				}
-
-				return result;
+			const result = {
+				dispose: () => {
+					result.dispose = Emitter._noop;
+					if (!this._disposed) {
+						remove();
+					}
+				},
 			};
-		}
+
+			if (Array.isArray(disposables)) {
+				disposables.push(result);
+			}
+
+			return result;
+		};
 		return this._event;
 	}
 
@@ -60,9 +54,7 @@ export class Emitter<T> {
 			// then emit all event. an inner/nested event might be
 			// the driver of this
 
-			if (this._deliveryQueue == null) {
-				this._deliveryQueue = new LinkedList();
-			}
+			this._deliveryQueue ??= new LinkedList();
 
 			for (let iter = this.listeners.iterator(), e = iter.next(); !e.done; e = iter.next()) {
 				this._deliveryQueue.push([e.value, event]);
@@ -76,14 +68,14 @@ export class Emitter<T> {
 					} else {
 						listener[0].call(listener[1], event);
 					}
-				} catch (e) {
+				} catch (_ex) {
 					debugger;
 				}
 			}
 		}
 	}
 
-	dispose() {
+	dispose(): void {
 		this.listeners?.clear();
 		this._deliveryQueue?.clear();
 		this._disposed = true;

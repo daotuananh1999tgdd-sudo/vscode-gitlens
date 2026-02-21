@@ -1,21 +1,22 @@
-import { CancellationToken, Disposable, Uri, workspace, WorkspaceFoldersChangeEvent } from 'vscode';
-import { git } from '@env/providers';
-import type { LiveShare, SharedService } from '../@types/vsls';
-import { Container } from '../container';
-import { Logger } from '../logger';
-import { debug, log } from '../system/decorators/log';
-import { join } from '../system/iterable';
-import { isVslsRoot, normalizePath } from '../system/path';
-import {
+import type { CancellationToken, WorkspaceFoldersChangeEvent } from 'vscode';
+import { Disposable, Uri, workspace } from 'vscode';
+import { git } from '@env/providers.js';
+import type { LiveShare, SharedService } from '../@types/vsls.d.js';
+import type { Container } from '../container.js';
+import { isVslsRoot } from '../system/-webview/path.vsls.js';
+import { debug, trace } from '../system/decorators/log.js';
+import { join } from '../system/iterable.js';
+import { getScopedLogger } from '../system/logger.scope.js';
+import { normalizePath } from '../system/path.js';
+import type {
 	GetRepositoriesForUriRequest,
-	GetRepositoriesForUriRequestType,
 	GetRepositoriesForUriResponse,
 	GitCommandRequest,
-	GitCommandRequestType,
 	GitCommandResponse,
 	RepositoryProxy,
 	RequestType,
-} from './protocol';
+} from './protocol.js';
+import { GetRepositoriesForUriRequestType, GitCommandRequestType } from './protocol.js';
 
 const defaultWhitelistFn = () => true;
 const gitWhitelist = new Map<string, (args: any[]) => boolean>([
@@ -41,6 +42,7 @@ const gitWhitelist = new Map<string, (args: any[]) => boolean>([
 	['status', defaultWhitelistFn],
 	['symbolic-ref', defaultWhitelistFn],
 	['tag', args => args[1] === '-l'],
+	['worktree', args => args[1] === 'list'],
 ]);
 
 const leadingSlashRegex = /^[/|\\]/;
@@ -49,8 +51,8 @@ const slash = 47; //CharCode.Slash;
 export class VslsHostService implements Disposable {
 	static ServiceId = 'proxy';
 
-	@log()
-	static async share(api: LiveShare, container: Container) {
+	@debug()
+	static async share(api: LiveShare, container: Container): Promise<VslsHostService> {
 		const service = await api.shareService(this.ServiceId);
 		if (service == null) {
 			throw new Error('Failed to share host service');
@@ -77,10 +79,10 @@ export class VslsHostService implements Disposable {
 		this.onRequest(GitCommandRequestType, this.onGitCommandRequest.bind(this));
 		this.onRequest(GetRepositoriesForUriRequestType, this.onGetRepositoriesForUriRequest.bind(this));
 
-		void this.onWorkspaceFoldersChanged();
+		this.onWorkspaceFoldersChanged();
 	}
 
-	dispose() {
+	dispose(): void {
 		this._disposable.dispose();
 		void this._api.unshareService(VslsHostService.ServiceId);
 	}
@@ -89,21 +91,29 @@ export class VslsHostService implements Disposable {
 		requestType: RequestType<TRequest, TResponse>,
 		handler: (request: TRequest, cancellation: CancellationToken) => Promise<TResponse>,
 	) {
-		this._service.onRequest(requestType.name, (args: any[], cancellation: CancellationToken) =>
-			handler(args[0], cancellation),
-		);
+		// eslint-disable-next-line prefer-arrow-callback
+		this._service.onRequest(requestType.name, function (args: any[], cancellation: CancellationToken) {
+			let request;
+			for (const arg of args) {
+				if (typeof arg === 'object' && '__type' in arg) {
+					request = arg;
+					break;
+				}
+			}
+			return handler(request ?? args[0], cancellation);
+		});
 	}
 
-	@log()
+	@debug()
 	private onAvailabilityChanged(_available: boolean) {
 		// TODO
 	}
 
-	@debug()
+	@trace()
 	private onWorkspaceFoldersChanged(_e?: WorkspaceFoldersChangeEvent) {
 		if (workspace.workspaceFolders == null || workspace.workspaceFolders.length === 0) return;
 
-		const cc = Logger.getCorrelationContext();
+		const scope = getScopedLogger();
 
 		this._localToSharedPaths.clear();
 		this._sharedToLocalPaths.clear();
@@ -114,7 +124,7 @@ export class VslsHostService implements Disposable {
 			localPath = normalizePath(f.uri.fsPath);
 			sharedPath = normalizePath(this.convertLocalUriToShared(f.uri).toString());
 
-			Logger.debug(cc, `shared='${sharedPath}' \u2194 local='${localPath}'`);
+			scope?.trace(`shared='${sharedPath}' \u2194 local='${localPath}'`);
 			this._localToSharedPaths.set(localPath, sharedPath);
 			this._sharedToLocalPaths.set(sharedPath, localPath);
 		}
@@ -128,74 +138,29 @@ export class VslsHostService implements Disposable {
 		this._sharedPathsRegex = new RegExp(`^(${sharedPaths})`, 'i');
 	}
 
-	@log()
+	@debug()
 	private async onGitCommandRequest(
 		request: GitCommandRequest,
-		_cancellation: CancellationToken,
+		cancellation: CancellationToken,
 	): Promise<GitCommandResponse> {
-		const { options, args } = request;
-
 		const fn = gitWhitelist.get(request.args[0]);
-		if (fn == null || !fn(request.args)) throw new Error(`Git ${request.args[0]} command is not allowed`);
+		if (!fn?.(request.args)) throw new Error(`Git ${request.args[0]} command is not allowed`);
 
-		let isRootWorkspace = false;
-		if (options.cwd != null && options.cwd.length > 0 && this._sharedToLocalPaths != null) {
-			// This is all so ugly, but basically we are converting shared paths to local paths
-			if (this._sharedPathsRegex?.test(options.cwd)) {
-				options.cwd = normalizePath(options.cwd).replace(this._sharedPathsRegex, (match, shared) => {
-					if (!isRootWorkspace) {
-						isRootWorkspace = shared === '/~0';
-					}
+		const { options, args } = request;
+		const [cwd, isRootWorkspace] = this.convertGitCommandCwd(options.cwd);
 
-					const local = this._sharedToLocalPaths.get(shared);
-					return local != null ? local : shared;
-				});
-			} else if (leadingSlashRegex.test(options.cwd)) {
-				const localCwd = this._sharedToLocalPaths.get('vsls:/~0');
-				if (localCwd != null) {
-					isRootWorkspace = true;
-					options.cwd = normalizePath(this.container.git.getAbsoluteUri(options.cwd, localCwd).fsPath);
-				}
-			}
-		}
-
-		let files = false;
-		let i = -1;
-		for (const arg of args) {
-			i++;
-			if (arg === '--') {
-				files = true;
-				continue;
-			}
-
-			if (!files) continue;
-
-			if (typeof arg === 'string') {
-				// If we are the "root" workspace, then we need to remove the leading slash off the path (otherwise it will not be treated as a relative path)
-				if (isRootWorkspace && leadingSlashRegex.test(arg[0])) {
-					args.splice(i, 1, arg.substr(1));
-				}
-
-				if (this._sharedPathsRegex?.test(arg)) {
-					args.splice(
-						i,
-						1,
-						normalizePath(arg).replace(this._sharedPathsRegex, (match, shared) => {
-							const local = this._sharedToLocalPaths.get(shared);
-							return local != null ? local : shared;
-						}),
-					);
-				}
-			}
-		}
-
-		let data = await git(options, ...args);
+		const result = await git(
+			this.container,
+			{ ...options, cwd: cwd, cancellation: cancellation },
+			...this.convertGitCommandArgs(args, isRootWorkspace),
+		);
+		let data = result.stdout;
 		if (typeof data === 'string') {
-			// And then we convert local paths to shared paths
+			// Convert local paths to shared paths
 			if (this._localPathsRegex != null && data.length > 0) {
-				data = data.replace(this._localPathsRegex, (match, local) => {
+				data = data.replace(this._localPathsRegex, (_match, local: string) => {
 					const shared = this._localToSharedPaths.get(normalizePath(local));
-					return shared != null ? shared : local;
+					return shared ?? local;
 				});
 			}
 
@@ -205,8 +170,8 @@ export class VslsHostService implements Disposable {
 		return { data: data.toString('binary'), isBuffer: true };
 	}
 
+	@debug()
 	// eslint-disable-next-line @typescript-eslint/require-await
-	@log()
 	private async onGetRepositoriesForUriRequest(
 		request: GetRepositoriesForUriRequest,
 		_cancellation: CancellationToken,
@@ -229,17 +194,12 @@ export class VslsHostService implements Disposable {
 		return { repositories: repositories };
 	}
 
-	@debug({
-		exit: result => `returned ${result.toString(true)}`,
-	})
+	@trace({ exit: true })
 	private convertLocalUriToShared(localUri: Uri) {
-		const cc = Logger.getCorrelationContext();
+		const scope = getScopedLogger();
 
 		let sharedUri = this._api.convertLocalUriToShared(localUri);
-		Logger.debug(
-			cc,
-			`LiveShare.convertLocalUriToShared(${localUri.toString(true)}) returned ${sharedUri.toString(true)}`,
-		);
+		scope?.addExitInfo(`returned ${sharedUri.toString(true)}`);
 
 		const localPath = localUri.path;
 		let sharedPath = sharedUri.path;
@@ -250,16 +210,80 @@ export class VslsHostService implements Disposable {
 		if (new RegExp(`${localPath}$`, 'i').test(sharedPath)) {
 			if (sharedPath.length === localPath.length) {
 				const folder = workspace.getWorkspaceFolder(localUri)!;
-				sharedUri = sharedUri.with({ path: `/~${folder.index}` });
+				sharedUri = sharedUri.with({ authority: '', path: `/~${folder.index}` });
 			} else {
-				sharedUri = sharedUri.with({ path: sharedPath.substr(0, sharedPath.length - localPath.length) });
+				sharedUri = sharedUri.with({
+					authority: '',
+					path: sharedPath.substring(0, sharedPath.length - localPath.length),
+				});
 			}
 		} else if (!sharedPath.startsWith('/~')) {
 			const folder = workspace.getWorkspaceFolder(localUri)!;
-			sharedUri = sharedUri.with({ path: `/~${folder.index}${sharedPath}` });
+			sharedUri = sharedUri.with({ authority: '', path: `/~${folder.index}${sharedPath}` });
 		}
 
 		return sharedUri;
+	}
+
+	private convertGitCommandCwd(cwd: string): [cwd: string, root: boolean];
+	private convertGitCommandCwd(cwd: string | undefined): [cwd: string | undefined, root: boolean];
+	private convertGitCommandCwd(cwd: string | undefined): [cwd: string | undefined, root: boolean] {
+		let isRootWorkspace = false;
+		if (cwd != null && cwd.length > 0 && this._sharedToLocalPaths != null) {
+			// This is all so ugly, but basically we are converting shared paths to local paths
+			if (this._sharedPathsRegex?.test(cwd)) {
+				cwd = normalizePath(cwd).replace(this._sharedPathsRegex, (_match, shared: string) => {
+					if (!isRootWorkspace) {
+						isRootWorkspace = shared === '/~0';
+					}
+
+					const local = this._sharedToLocalPaths.get(shared);
+					return local ?? shared;
+				});
+			} else if (leadingSlashRegex.test(cwd)) {
+				const localCwd = this._sharedToLocalPaths.get('vsls:/~0');
+				if (localCwd != null) {
+					isRootWorkspace = true;
+					cwd = normalizePath(this.container.git.getAbsoluteUri(cwd, localCwd).fsPath);
+				}
+			}
+		}
+
+		return [cwd, isRootWorkspace];
+	}
+
+	private convertGitCommandArgs(args: any[], isRootWorkspace: boolean): any[] {
+		let files = false;
+		let i = -1;
+		for (const arg of args) {
+			i++;
+			if (arg === '--') {
+				files = true;
+				continue;
+			}
+
+			if (!files) continue;
+
+			if (typeof arg === 'string') {
+				// If we are the "root" workspace, then we need to remove the leading slash off the path (otherwise it will not be treated as a relative path)
+				if (isRootWorkspace && leadingSlashRegex.test(arg[0])) {
+					args.splice(i, 1, arg.substring(1));
+				}
+
+				if (this._sharedPathsRegex?.test(arg)) {
+					args.splice(
+						i,
+						1,
+						normalizePath(arg).replace(this._sharedPathsRegex, (_match, shared: string) => {
+							const local = this._sharedToLocalPaths.get(shared);
+							return local ?? shared;
+						}),
+					);
+				}
+			}
+		}
+
+		return args;
 	}
 
 	private convertSharedUriToLocal(sharedUri: Uri) {
@@ -272,7 +296,7 @@ export class VslsHostService implements Disposable {
 		let localPath = localUri.path;
 		const sharedPath = sharedUri.path;
 		if (localPath.endsWith(sharedPath)) {
-			localPath = localPath.substr(0, localPath.length - sharedPath.length);
+			localPath = localPath.substring(0, localPath.length - sharedPath.length);
 		}
 
 		if (localPath.charCodeAt(localPath.length - 1) === slash) {

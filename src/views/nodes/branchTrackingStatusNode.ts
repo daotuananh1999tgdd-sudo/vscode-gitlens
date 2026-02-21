@@ -1,76 +1,115 @@
 import { MarkdownString, ThemeColor, ThemeIcon, TreeItem, TreeItemCollapsibleState, window } from 'vscode';
-import { Colors } from '../../constants';
-import { GitUri } from '../../git/gitUri';
-import { GitBranch, GitLog, GitRemote, GitRevision, GitTrackingState } from '../../git/models';
-import { fromNow } from '../../system/date';
-import { gate } from '../../system/decorators/gate';
-import { debug } from '../../system/decorators/log';
-import { first, map } from '../../system/iterable';
-import { pluralize } from '../../system/string';
-import { ViewsWithCommits } from '../viewBase';
-import { BranchNode } from './branchNode';
-import { BranchTrackingStatusFilesNode } from './branchTrackingStatusFilesNode';
-import { CommitNode } from './commitNode';
-import { LoadMoreNode } from './common';
-import { insertDateMarkers } from './helpers';
-import { ContextValues, PageableViewNode, ViewNode } from './viewNode';
+import type { Colors } from '../../constants.colors.js';
+import type { FilesComparison } from '../../git/actions/commit.js';
+import { GitUri } from '../../git/gitUri.js';
+import type { GitBranch, GitTrackingUpstream } from '../../git/models/branch.js';
+import type { GitLog } from '../../git/models/log.js';
+import type { GitRemote } from '../../git/models/remote.js';
+import { getRemoteNameFromBranchName } from '../../git/utils/branch.utils.js';
+import { getHighlanderProviders } from '../../git/utils/remote.utils.js';
+import { createRevisionRange } from '../../git/utils/revision.utils.js';
+import { getUpstreamStatus } from '../../git/utils/status.utils.js';
+import { fromNow } from '../../system/date.js';
+import { gate } from '../../system/decorators/gate.js';
+import { trace } from '../../system/decorators/log.js';
+import { first, last, map } from '../../system/iterable.js';
+import { pluralize } from '../../system/string.js';
+import type { ViewsWithCommits } from '../viewBase.js';
+import type { PageableViewNode } from './abstract/viewNode.js';
+import { ContextValues, getViewNodeId, ViewNode } from './abstract/viewNode.js';
+import { BranchTrackingStatusFilesNode } from './branchTrackingStatusFilesNode.js';
+import { CommitNode } from './commitNode.js';
+import { LoadMoreNode } from './common.js';
+import { insertDateMarkers } from './utils/-webview/node.utils.js';
 
 export interface BranchTrackingStatus {
 	ref: string;
 	repoPath: string;
-	state: GitTrackingState;
-	upstream?: string;
+	upstream?: GitTrackingUpstream;
 }
 
-export class BranchTrackingStatusNode extends ViewNode<ViewsWithCommits> implements PageableViewNode {
-	static key = ':status-branch:upstream';
-	static getId(
-		repoPath: string,
-		name: string,
-		root: boolean,
-		upstream: string | undefined,
-		upstreamType: string,
-	): string {
-		return `${BranchNode.getId(repoPath, name, root)}${this.key}(${upstream ?? ''}):${upstreamType}`;
-	}
-
-	private readonly options: {
-		showAheadCommits?: boolean;
-	};
+export class BranchTrackingStatusNode
+	extends ViewNode<'tracking-status', ViewsWithCommits>
+	implements PageableViewNode
+{
+	limit: number | undefined;
 
 	constructor(
 		view: ViewsWithCommits,
-		parent: ViewNode,
+		protected override readonly parent: ViewNode,
 		public readonly branch: GitBranch,
 		public readonly status: BranchTrackingStatus,
-		public readonly upstreamType: 'ahead' | 'behind' | 'same' | 'none',
+		public readonly upstreamType: 'ahead' | 'behind' | 'same' | 'missing' | 'none',
 		// Specifies that the node is shown as a root
 		public readonly root: boolean = false,
-		options?: {
+		private readonly options?: {
 			showAheadCommits?: boolean;
+			unpublishedCommits?: Set<string>;
 		},
 	) {
-		super(GitUri.fromRepoPath(status.repoPath), view, parent);
+		super('tracking-status', GitUri.fromRepoPath(status.repoPath), view, parent);
 
-		this.options = { showAheadCommits: false, ...options };
+		this.updateContext({
+			branch: branch,
+			branchStatus: status,
+			branchStatusUpstreamType: upstreamType,
+			root: root,
+		});
+		this._uniqueId = getViewNodeId(this.type, this.context);
+		this.limit = this.view.getNodeLastKnownLimit(this);
 	}
 
 	override get id(): string {
-		return BranchTrackingStatusNode.getId(
-			this.status.repoPath,
-			this.status.ref,
-			this.root,
-			this.status.upstream,
-			this.upstreamType,
-		);
+		return this._uniqueId;
 	}
 
 	get repoPath(): string {
 		return this.uri.repoPath!;
 	}
 
+	async getFilesComparison(): Promise<FilesComparison | undefined> {
+		// if we are ahead we don't actually add the files node, just each of its children individually
+		if (this.upstreamType === 'ahead') {
+			const node = new BranchTrackingStatusFilesNode(
+				this.view,
+				this,
+				this.branch,
+				this.status as Required<BranchTrackingStatus>,
+				this.upstreamType,
+			);
+
+			const comparison = await node?.getFilesComparison();
+			if (comparison == null) return undefined;
+
+			// Get the oldest unpublished (unpushed) commit
+			const ref = this.options?.unpublishedCommits != null ? last(this.options.unpublishedCommits) : undefined;
+			if (ref == null) return undefined;
+
+			const resolved = await this.view.container.git
+				.getRepositoryService(this.repoPath)
+				.revision.resolveRevision(`${ref}^`);
+			return {
+				...comparison,
+				ref1: resolved.sha,
+				ref2: comparison.ref1,
+				title: `Changes to push to ${comparison.ref2}`,
+			};
+		}
+
+		const children = await this.getChildren();
+		const node = children.find(c => c.is('tracking-status-files'));
+		return node?.getFilesComparison();
+	}
+
 	async getChildren(): Promise<ViewNode[]> {
-		if (this.upstreamType === 'same' || this.upstreamType === 'none') return [];
+		if (
+			this.status.upstream == null ||
+			this.upstreamType === 'same' ||
+			this.upstreamType === 'missing' ||
+			this.upstreamType === 'none'
+		) {
+			return [];
+		}
 
 		const log = await this.getLog();
 		if (log == null) return [];
@@ -79,15 +118,14 @@ export class BranchTrackingStatusNode extends ViewNode<ViewsWithCommits> impleme
 		if (this.upstreamType === 'ahead') {
 			// Since the last commit when we are looking 'ahead' can have no previous (because of the range given) -- look it up
 			commits = [...log.commits.values()];
-			const commit = commits[commits.length - 1];
+			const commit = commits.at(-1)!;
 			const previousSha = await commit.getPreviousSha();
 			if (previousSha == null) {
-				const previousLog = await this.view.container.git.getLog(this.uri.repoPath!, {
-					limit: 2,
-					ref: commit.sha,
-				});
+				const previousLog = await this.view.container.git
+					.getRepositoryService(this.uri.repoPath!)
+					.commits.getLog(commit.sha, { limit: 1 });
 				if (previousLog != null) {
-					commits[commits.length - 1] = first(previousLog.commits.values());
+					commits[commits.length - 1] = first(previousLog.commits.values())!;
 				}
 			}
 		} else {
@@ -97,12 +135,7 @@ export class BranchTrackingStatusNode extends ViewNode<ViewsWithCommits> impleme
 		const children = [];
 
 		let showFiles = true;
-		if (
-			!this.options.showAheadCommits &&
-			this.upstreamType === 'ahead' &&
-			this.status.upstream &&
-			this.status.state.ahead > 0
-		) {
+		if (!this.options?.showAheadCommits && this.upstreamType === 'ahead' && this.status.upstream.state.ahead) {
 			showFiles = false;
 			// TODO@eamodio fix this
 			children.push(
@@ -112,7 +145,6 @@ export class BranchTrackingStatusNode extends ViewNode<ViewsWithCommits> impleme
 					this.branch,
 					this.status as Required<BranchTrackingStatus>,
 					this.upstreamType,
-					this.root,
 				).getChildren()),
 			);
 		} else {
@@ -125,21 +157,18 @@ export class BranchTrackingStatusNode extends ViewNode<ViewsWithCommits> impleme
 			);
 
 			if (log.hasMore) {
-				children.push(new LoadMoreNode(this.view, this, children[children.length - 1]));
+				children.push(new LoadMoreNode(this.view, this, children.at(-1)!));
 			}
 		}
 
 		if (showFiles) {
-			children.splice(
-				0,
-				0,
+			children.unshift(
 				new BranchTrackingStatusFilesNode(
 					this.view,
 					this,
 					this.branch,
 					this.status as Required<BranchTrackingStatus>,
 					this.upstreamType,
-					this.root,
 				),
 			);
 		}
@@ -150,9 +179,25 @@ export class BranchTrackingStatusNode extends ViewNode<ViewsWithCommits> impleme
 	async getTreeItem(): Promise<TreeItem> {
 		let lastFetched = 0;
 
-		if (this.upstreamType !== 'none') {
+		if (this.upstreamType !== 'missing' && this.upstreamType !== 'none') {
 			const repo = this.view.container.git.getRepository(this.repoPath);
 			lastFetched = (await repo?.getLastFetched()) ?? 0;
+		}
+
+		function getBranchStatus(this: BranchTrackingStatusNode, remote: GitRemote | undefined) {
+			return `$(git-branch) \`${this.branch.name}\` is ${getUpstreamStatus(this.status.upstream, {
+				empty: this.status.upstream!.missing
+					? `missing upstream $(git-branch) \`${this.status.upstream!.name}\``
+					: `up to date with $(git-branch) \`${this.status.upstream!.name}\`${
+							remote?.provider?.name ? ` on ${remote.provider.name}` : ''
+						}`,
+				expand: true,
+				icons: true,
+				separator: ', ',
+				suffix: ` $(git-branch) \`${this.status.upstream!.name}\`${
+					remote?.provider?.name ? ` on ${remote.provider.name}` : ''
+				}`,
+			})}`;
 		}
 
 		let label;
@@ -165,55 +210,61 @@ export class BranchTrackingStatusNode extends ViewNode<ViewsWithCommits> impleme
 			case 'ahead': {
 				const remote = await this.branch.getRemote();
 
-				label = `Changes to push to ${remote?.name ?? GitBranch.getRemote(this.status.upstream!)}${
-					remote?.provider?.name ? ` on ${remote?.provider.name}` : ''
+				label = 'Outgoing';
+				description = `${pluralize('commit', this.status.upstream!.state.ahead)} to push to ${
+					remote?.name ?? getRemoteNameFromBranchName(this.status.upstream!.name)
 				}`;
-				description = pluralize('commit', this.status.state.ahead);
-				tooltip = `Branch $(git-branch) ${this.branch.name} is ${pluralize('commit', this.status.state.ahead, {
-					infix: '$(arrow-up) ',
-				})} ahead of $(git-branch) ${this.status.upstream}${
-					remote?.provider?.name ? ` on ${remote.provider.name}` : ''
-				}`;
+				tooltip = `${pluralize('commit', this.status.upstream!.state.ahead)} to push to \`${
+					this.status.upstream!.name
+				}\`${remote?.provider?.name ? ` on ${remote?.provider.name}` : ''}\\\n${getBranchStatus.call(
+					this,
+					remote,
+				)}`;
 
 				collapsibleState = TreeItemCollapsibleState.Collapsed;
 				contextValue = this.root
 					? ContextValues.StatusAheadOfUpstream
 					: ContextValues.BranchStatusAheadOfUpstream;
-				icon = new ThemeIcon('cloud-upload', new ThemeColor(Colors.UnpushlishedChangesIconColor));
+				icon = new ThemeIcon(
+					'cloud-upload',
+					new ThemeColor('gitlens.unpublishedChangesIconColor' satisfies Colors),
+				);
 
 				break;
 			}
 			case 'behind': {
 				const remote = await this.branch.getRemote();
 
-				label = `Changes to pull from ${remote?.name ?? GitBranch.getRemote(this.status.upstream!)}${
-					remote?.provider?.name ? ` on ${remote.provider.name}` : ''
+				label = 'Incoming';
+				description = `${pluralize('commit', this.status.upstream!.state.behind)} to pull from ${
+					remote?.name ?? getRemoteNameFromBranchName(this.status.upstream!.name)
 				}`;
-				description = pluralize('commit', this.status.state.behind);
-				tooltip = `Branch $(git-branch) ${this.branch.name} is ${pluralize('commit', this.status.state.behind, {
-					infix: '$(arrow-down) ',
-				})} behind $(git-branch) ${this.status.upstream}${
-					remote?.provider?.name ? ` on ${remote.provider.name}` : ''
-				}`;
+				tooltip = `${pluralize('commit', this.status.upstream!.state.behind)} to pull from \`${
+					this.status.upstream!.name
+				}\`${remote?.provider?.name ? ` on ${remote.provider.name}` : ''}\\\n${getBranchStatus.call(
+					this,
+					remote,
+				)}`;
 
 				collapsibleState = TreeItemCollapsibleState.Collapsed;
 				contextValue = this.root
 					? ContextValues.StatusBehindUpstream
 					: ContextValues.BranchStatusBehindUpstream;
-				icon = new ThemeIcon('cloud-download', new ThemeColor(Colors.UnpulledChangesIconColor));
+				icon = new ThemeIcon(
+					'cloud-download',
+					new ThemeColor('gitlens.unpulledChangesIconColor' satisfies Colors),
+				);
 
 				break;
 			}
 			case 'same': {
 				const remote = await this.branch.getRemote();
 
-				label = `Up to date with ${remote?.name ?? GitBranch.getRemote(this.status.upstream!)}${
+				label = `Up to date with ${remote?.name ?? getRemoteNameFromBranchName(this.status.upstream!.name)}${
 					remote?.provider?.name ? ` on ${remote.provider.name}` : ''
 				}`;
-				description = lastFetched ? `Last fetched ${fromNow(new Date(lastFetched))}` : '';
-				tooltip = `Branch $(git-branch) ${this.branch.name} is up to date with $(git-branch) ${
-					this.status.upstream
-				}${remote?.provider?.name ? ` on ${remote.provider.name}` : ''}`;
+				description = lastFetched ? fromNow(lastFetched) : '';
+				tooltip = getBranchStatus.call(this, remote);
 
 				collapsibleState = TreeItemCollapsibleState.None;
 				contextValue = this.root
@@ -223,21 +274,39 @@ export class BranchTrackingStatusNode extends ViewNode<ViewsWithCommits> impleme
 
 				break;
 			}
+			case 'missing': {
+				const remote = await this.branch.getRemote();
+
+				label = `Missing upstream branch${remote?.provider?.name ? ` on ${remote.provider.name}` : ''}`;
+				description = this.status.upstream!.name;
+				tooltip = getBranchStatus.call(this, remote);
+
+				collapsibleState = TreeItemCollapsibleState.None;
+				contextValue = this.root
+					? ContextValues.StatusMissingUpstream
+					: ContextValues.BranchStatusSameAsUpstream;
+				icon = new ThemeIcon(
+					'warning',
+					new ThemeColor('gitlens.decorations.branchMissingUpstreamForegroundColor' satisfies Colors),
+				);
+
+				break;
+			}
 			case 'none': {
-				const remotes = await this.view.container.git.getRemotesWithProviders(this.branch.repoPath);
-				const providers = GitRemote.getHighlanderProviders(remotes);
+				const remotes = await this.view.container.git
+					.getRepositoryService(this.branch.repoPath)
+					.remotes.getRemotesWithProviders();
+				const providers = getHighlanderProviders(remotes);
 				const providerName = providers?.length ? providers[0].name : undefined;
 
 				label = `Publish ${this.branch.name} to ${providerName ?? 'a remote'}`;
-				tooltip = `Branch $(git-branch) ${this.branch.name} hasn't been published to ${
-					providerName ?? 'a remote'
-				}`;
+				tooltip = `\`${this.branch.name}\` hasn't been published to ${providerName ?? 'a remote'}`;
 
 				collapsibleState = TreeItemCollapsibleState.None;
 				contextValue = this.root ? ContextValues.StatusNoUpstream : ContextValues.BranchStatusNoUpstream;
 				icon = new ThemeIcon(
 					'cloud-upload',
-					remotes.length ? new ThemeColor(Colors.UnpushlishedChangesIconColor) : undefined,
+					remotes.length ? new ThemeColor('gitlens.unpublishedChangesIconColor' satisfies Colors) : undefined,
 				);
 
 				break;
@@ -249,7 +318,7 @@ export class BranchTrackingStatusNode extends ViewNode<ViewsWithCommits> impleme
 		item.contextValue = contextValue;
 		item.description = description;
 		if (lastFetched) {
-			tooltip += `\n\nLast fetched ${fromNow(new Date(lastFetched))}`;
+			tooltip += `\n\nLast fetched ${fromNow(lastFetched)}`;
 		}
 		item.iconPath = icon;
 
@@ -262,9 +331,8 @@ export class BranchTrackingStatusNode extends ViewNode<ViewsWithCommits> impleme
 		return item;
 	}
 
-	@gate()
-	@debug()
-	override refresh(reset?: boolean) {
+	@trace()
+	override refresh(reset?: boolean): void {
 		if (reset) {
 			this._log = undefined;
 		}
@@ -277,32 +345,30 @@ export class BranchTrackingStatusNode extends ViewNode<ViewsWithCommits> impleme
 		if (this._log == null) {
 			const range =
 				this.upstreamType === 'ahead'
-					? GitRevision.createRange(this.status.upstream, this.status.ref)
-					: GitRevision.createRange(this.status.ref, this.status.upstream);
+					? createRevisionRange(this.status.upstream?.name, this.status.ref, '..')
+					: createRevisionRange(this.status.ref, this.status.upstream?.name, '..');
 
-			this._log = await this.view.container.git.getLog(this.uri.repoPath!, {
-				limit: this.limit ?? this.view.config.defaultItemLimit,
-				ref: range,
-			});
+			this._log = await this.view.container.git
+				.getRepositoryService(this.uri.repoPath!)
+				.commits.getLog(range, { limit: this.limit ?? this.view.config.defaultItemLimit });
 		}
 
 		return this._log;
 	}
 
-	get hasMore() {
+	get hasMore(): boolean {
 		return this._log?.hasMore ?? true;
 	}
 
-	limit: number | undefined = this.view.getNodeLastKnownLimit(this);
 	@gate()
-	async loadMore(limit?: number | { until?: any }) {
+	async loadMore(limit?: number | { until?: any }): Promise<void> {
 		let log = await window.withProgress(
 			{
 				location: { viewId: this.view.id },
 			},
 			() => this.getLog(),
 		);
-		if (log == null || !log.hasMore) return;
+		if (!log?.hasMore) return;
 
 		log = await log.more?.(limit ?? this.view.config.pageItemLimit);
 		if (this._log === log) return;

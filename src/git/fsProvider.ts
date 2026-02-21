@@ -1,38 +1,49 @@
-import {
-	Disposable,
-	Event,
-	EventEmitter,
-	FileChangeEvent,
-	FileStat,
-	FileSystemError,
-	FileSystemProvider,
-	FileType,
-	Uri,
-	workspace,
-} from 'vscode';
-import { isLinux } from '@env/platform';
-import { Schemes } from '../constants';
-import { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { debug } from '../system/decorators/log';
-import { map } from '../system/iterable';
-import { normalizePath, relative } from '../system/path';
-import { TernarySearchTree } from '../system/searchTree';
-import { GitRevision, GitTreeEntry } from './models';
+import type { Event, FileChangeEvent, FileStat, FileSystemProvider, Uri } from 'vscode';
+import { Disposable, EventEmitter, FileSystemError, FileType, workspace } from 'vscode';
+import { isLinux } from '@env/platform.js';
+import { Schemes } from '../constants.js';
+import type { Container } from '../container.js';
+import { relative } from '../system/-webview/path.js';
+import { trace } from '../system/decorators/log.js';
+import { map } from '../system/iterable.js';
+import { Logger } from '../system/logger.js';
+import { getScopedLogger } from '../system/logger.scope.js';
+import { normalizePath } from '../system/path.js';
+import { PromiseCache } from '../system/promiseCache.js';
+import { TernarySearchTree } from '../system/searchTree.js';
+import { ShowError } from './errors.js';
+import { GitUri, isGitUri } from './gitUri.js';
+import { deletedOrMissing } from './models/revision.js';
+import type { GitTreeEntry, GitTreeType } from './models/tree.js';
 
-const emptyArray = new Uint8Array(0);
+const emptyArray = Object.freeze(new Uint8Array(0));
+const emptyDisposable: Disposable = Object.freeze({ dispose: () => {} });
 
-export function fromGitLensFSUri(uri: Uri): { path: string; ref: string; repoPath: string } {
-	const gitUri = GitUri.is(uri) ? uri : GitUri.fromRevisionUri(uri);
-	return { path: gitUri.relativePath, ref: gitUri.sha!, repoPath: gitUri.repoPath! };
+export function fromGitLensFSUri(uri: Uri): { path: string; ref: string; repoPath: string; submoduleSha?: string } {
+	const gitUri = isGitUri(uri) ? uri : new GitUri(uri);
+	return {
+		path: gitUri.relativePath,
+		ref: gitUri.sha!,
+		repoPath: gitUri.repoPath!,
+		submoduleSha: gitUri.submoduleSha,
+	};
 }
 
 export class GitFileSystemProvider implements FileSystemProvider, Disposable {
+	private _onDidChangeFile = new EventEmitter<FileChangeEvent[]>();
+	get onDidChangeFile(): Event<FileChangeEvent[]> {
+		return this._onDidChangeFile.event;
+	}
+
 	private readonly _disposable: Disposable;
-	private readonly _searchTreeMap = new Map<string, Promise<TernarySearchTree<string, GitTreeEntry>>>();
+	private readonly _searchTreeMap = new PromiseCache<string, TernarySearchTree<string, GitTreeEntry>>({
+		capacity: 50,
+		accessTTL: 1000 * 60 * 10, // 10 minutes idle
+	});
 
 	constructor(private readonly container: Container) {
 		this._disposable = Disposable.from(
+			this._onDidChangeFile,
 			workspace.registerFileSystemProvider(Schemes.GitLens, this, {
 				isCaseSensitive: isLinux,
 				isReadonly: true,
@@ -40,31 +51,26 @@ export class GitFileSystemProvider implements FileSystemProvider, Disposable {
 		);
 	}
 
-	dispose() {
+	dispose(): void {
 		this._disposable.dispose();
 	}
 
-	private _onDidChangeFile = new EventEmitter<FileChangeEvent[]>();
-	get onDidChangeFile(): Event<FileChangeEvent[]> {
-		return this._onDidChangeFile.event;
+	copy?(source: Uri, _destination: Uri, _options: { readonly overwrite: boolean }): void | Thenable<void> {
+		throw FileSystemError.NoPermissions(source);
+	}
+	createDirectory(uri: Uri): void | Thenable<void> {
+		throw FileSystemError.NoPermissions(uri);
+	}
+	delete(uri: Uri, _options: { readonly recursive: boolean }): void | Thenable<void> {
+		throw FileSystemError.NoPermissions(uri);
 	}
 
-	copy?(): void | Thenable<void> {
-		throw FileSystemError.NoPermissions;
-	}
-	createDirectory(): void | Thenable<void> {
-		throw FileSystemError.NoPermissions;
-	}
-	delete(): void | Thenable<void> {
-		throw FileSystemError.NoPermissions;
-	}
-
-	@debug()
+	@trace()
 	async readDirectory(uri: Uri): Promise<[string, FileType][]> {
 		const { path, ref, repoPath } = fromGitLensFSUri(uri);
 
 		const tree = await this.getTree(path, ref, repoPath);
-		if (tree === undefined) throw FileSystemError.FileNotFound(uri);
+		if (tree == null) throw FileSystemError.FileNotFound(uri);
 
 		const items = [
 			...map<GitTreeEntry, [string, FileType]>(tree, t => [
@@ -75,85 +81,101 @@ export class GitFileSystemProvider implements FileSystemProvider, Disposable {
 		return items;
 	}
 
-	@debug()
+	@trace()
 	async readFile(uri: Uri): Promise<Uint8Array> {
-		const { path, ref, repoPath } = fromGitLensFSUri(uri);
+		const scope = getScopedLogger();
+		const { path, ref, repoPath, submoduleSha } = fromGitLensFSUri(uri);
 
-		if (ref === GitRevision.deletedOrMissing) return emptyArray;
+		if (ref === deletedOrMissing) return emptyArray;
 
-		const data = await this.container.git.getRevisionContent(repoPath, path, ref);
-		return data != null ? data : emptyArray;
+		// If this is a submodule, return the submodule commit format directly
+		if (submoduleSha) {
+			return new TextEncoder().encode(`Subproject commit ${submoduleSha}\n`);
+		}
+
+		const svc = this.container.git.getRepositoryService(repoPath);
+
+		let data: Uint8Array | undefined;
+		try {
+			data = await svc.revision.getRevisionContent(ref, path);
+		} catch (ex) {
+			if (ShowError.is(ex, 'invalidObject') || ShowError.is(ex, 'invalidRevision')) {
+				// Check the tree entry to determine if this is a regular file or submodule
+				// For submodules (type 'commit' in git tree), return the standard git submodule diff format
+				// This matches the format Git uses in diff output (see diff.c:show_submodule_diff_summary)
+				const treeEntry = await svc.revision.getTreeEntryForRevision(ref, path);
+				if (treeEntry?.type === 'commit') {
+					return new TextEncoder().encode(`Subproject commit ${treeEntry.oid}\n`);
+				}
+			}
+
+			if (ShowError.is(ex) && ex.details.reason !== 'other') {
+				return emptyArray;
+			}
+
+			Logger.error(ex, scope, `Failed to read file for ${uri.toString(true)}`);
+		}
+
+		return data ?? emptyArray;
 	}
 
-	rename(): void | Thenable<void> {
-		throw FileSystemError.NoPermissions;
+	rename(oldUri: Uri, _newUri: Uri, _options: { readonly overwrite: boolean }): void | Thenable<void> {
+		throw FileSystemError.NoPermissions(oldUri);
 	}
 
-	@debug()
+	@trace()
 	async stat(uri: Uri): Promise<FileStat> {
-		const { path, ref, repoPath } = fromGitLensFSUri(uri);
+		const { path, ref, repoPath, submoduleSha } = fromGitLensFSUri(uri);
 
-		if (ref === GitRevision.deletedOrMissing) {
-			return {
-				type: FileType.File,
-				size: 0,
-				ctime: 0,
-				mtime: 0,
-			};
+		if (ref === deletedOrMissing) {
+			return { type: FileType.File, size: 0, ctime: 0, mtime: 0 };
+		}
+
+		// Submodules appear as files in diff views
+		if (submoduleSha) {
+			return { type: FileType.File, size: 0, ctime: 0, mtime: 0 };
 		}
 
 		let treeItem;
 
 		const searchTree = this._searchTreeMap.get(ref);
-		if (searchTree !== undefined) {
+		if (searchTree != null) {
 			// Add the fake root folder to the path
 			treeItem = (await searchTree).get(`/~/${path}`);
 		} else {
-			if (path == null || path.length === 0) {
+			if (!path) {
 				const tree = await this.getTree(path, ref, repoPath);
-				if (tree === undefined) throw FileSystemError.FileNotFound(uri);
+				if (tree == null) throw FileSystemError.FileNotFound(uri);
 
-				return {
-					type: FileType.Directory,
-					size: 0,
-					ctime: 0,
-					mtime: 0,
-				};
+				return { type: FileType.Directory, size: 0, ctime: 0, mtime: 0 };
 			}
 
-			treeItem = await this.container.git.getTreeEntryForRevision(repoPath, path, ref);
+			treeItem = await this.container.git
+				.getRepositoryService(repoPath)
+				.revision.getTreeEntryForRevision(ref, path);
 		}
 
-		if (treeItem === undefined) {
+		if (treeItem == null) {
 			throw FileSystemError.FileNotFound(uri);
 		}
 
-		return {
-			type: typeToFileType(treeItem.type),
-			size: treeItem.size,
-			ctime: 0,
-			mtime: 0,
-		};
+		return { type: typeToFileType(treeItem.type), size: treeItem.size, ctime: 0, mtime: 0 };
 	}
 
 	watch(): Disposable {
-		return {
-			dispose: () => {
-				// nothing to dispose
-			},
-		};
+		return emptyDisposable;
 	}
 
-	writeFile(): void | Thenable<void> {
-		throw FileSystemError.NoPermissions;
+	writeFile(uri: Uri): void | Thenable<void> {
+		throw FileSystemError.NoPermissions(uri);
 	}
 
 	private async createSearchTree(ref: string, repoPath: string) {
 		const searchTree = TernarySearchTree.forPaths<GitTreeEntry>();
-		const trees = await this.container.git.getTreeForRevision(repoPath, ref);
+		const trees = await this.container.git.getRepositoryService(repoPath).revision.getTreeForRevision(ref);
 
 		// Add a fake root folder so that searches will work
-		searchTree.set('~', { commitSha: '', path: '~', size: 0, type: 'tree' });
+		searchTree.set('~', { ref: '', oid: '', path: '~', size: 0, type: 'tree' });
 		for (const item of trees) {
 			searchTree.set(`~/${item.path}`, item);
 		}
@@ -162,13 +184,7 @@ export class GitFileSystemProvider implements FileSystemProvider, Disposable {
 	}
 
 	private getOrCreateSearchTree(ref: string, repoPath: string) {
-		let searchTree = this._searchTreeMap.get(ref);
-		if (searchTree === undefined) {
-			searchTree = this.createSearchTree(ref, repoPath);
-			this._searchTreeMap.set(ref, searchTree);
-		}
-
-		return searchTree;
+		return this._searchTreeMap.getOrCreate(ref, () => this.createSearchTree(ref, repoPath));
 	}
 
 	private async getTree(path: string, ref: string, repoPath: string) {
@@ -178,12 +194,15 @@ export class GitFileSystemProvider implements FileSystemProvider, Disposable {
 	}
 }
 
-function typeToFileType(type: 'blob' | 'tree' | undefined | null) {
+function typeToFileType(type: GitTreeType | undefined | null) {
 	switch (type) {
 		case 'blob':
 			return FileType.File;
 		case 'tree':
 			return FileType.Directory;
+		case 'commit':
+			// Submodules (gitlinks) appear as files in the diff view
+			return FileType.File;
 		default:
 			return FileType.Unknown;
 	}

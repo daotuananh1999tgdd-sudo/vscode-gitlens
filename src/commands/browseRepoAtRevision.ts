@@ -1,13 +1,14 @@
-import { TextEditor, Uri } from 'vscode';
-import { Commands, CoreCommands } from '../constants';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { Logger } from '../logger';
-import { Messages } from '../messages';
-import { command, executeCoreCommand } from '../system/command';
-import { basename } from '../system/path';
-import { openWorkspace, OpenWorkspaceLocation } from '../system/utils';
-import { ActiveEditorCommand, CommandContext, getCommandUri } from './base';
+import type { TextEditor, Uri } from 'vscode';
+import type { Container } from '../container.js';
+import { GitUri } from '../git/gitUri.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { command, executeCoreCommand } from '../system/-webview/command.js';
+import { openWorkspace } from '../system/-webview/vscode/workspaces.js';
+import { Logger } from '../system/logger.js';
+import { basename } from '../system/path.js';
+import { ActiveEditorCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
+import type { CommandContext } from './commandContext.js';
 
 export interface BrowseRepoAtRevisionCommandArgs {
 	uri?: Uri;
@@ -20,30 +21,30 @@ export interface BrowseRepoAtRevisionCommandArgs {
 export class BrowseRepoAtRevisionCommand extends ActiveEditorCommand {
 	constructor(private readonly container: Container) {
 		super([
-			Commands.BrowseRepoAtRevision,
-			Commands.BrowseRepoAtRevisionInNewWindow,
-			Commands.BrowseRepoBeforeRevision,
-			Commands.BrowseRepoBeforeRevisionInNewWindow,
+			'gitlens.browseRepoAtRevision',
+			'gitlens.browseRepoAtRevisionInNewWindow',
+			'gitlens.browseRepoBeforeRevision',
+			'gitlens.browseRepoBeforeRevisionInNewWindow',
 		]);
 	}
 
-	protected override preExecute(context: CommandContext, args?: BrowseRepoAtRevisionCommandArgs) {
+	protected override preExecute(context: CommandContext, args?: BrowseRepoAtRevisionCommandArgs): Promise<void> {
 		switch (context.command) {
-			case Commands.BrowseRepoAtRevisionInNewWindow:
+			case 'gitlens.browseRepoAtRevisionInNewWindow':
 				args = { ...args, before: false, openInNewWindow: true };
 				break;
-			case Commands.BrowseRepoBeforeRevision:
+			case 'gitlens.browseRepoBeforeRevision':
 				args = { ...args, before: true, openInNewWindow: false };
 				break;
-			case Commands.BrowseRepoBeforeRevisionInNewWindow:
+			case 'gitlens.browseRepoBeforeRevisionInNewWindow':
 				args = { ...args, before: true, openInNewWindow: true };
 				break;
 		}
 
-		return this.execute(context.editor!, context.uri, args);
+		return this.execute(context.editor, context.uri, args);
 	}
 
-	async execute(editor: TextEditor, uri?: Uri, args?: BrowseRepoAtRevisionCommandArgs) {
+	async execute(editor: TextEditor | undefined, uri?: Uri, args?: BrowseRepoAtRevisionCommandArgs): Promise<void> {
 		args = { ...args };
 
 		try {
@@ -55,25 +56,25 @@ export class BrowseRepoAtRevisionCommand extends ActiveEditorCommand {
 			}
 
 			let gitUri = await GitUri.fromUri(uri);
-			if (gitUri.sha == null) return;
+			if (gitUri.repoPath == null || gitUri.sha == null) throw new Error('No repo or SHA for Uri');
 
-			const sha = args?.before
-				? await this.container.git.resolveReference(gitUri.repoPath!, `${gitUri.sha}^`)
-				: gitUri.sha;
-			uri = this.container.git.getRevisionUri(sha, gitUri.repoPath!, gitUri.repoPath!);
-			gitUri = GitUri.fromRevisionUri(uri);
+			const svc = this.container.git.getRepositoryService(gitUri.repoPath);
+
+			const sha = args?.before ? (await svc.revision.resolveRevision(`${gitUri.sha}^`)).sha : gitUri.sha;
+			uri = svc.getRevisionUri(sha, gitUri.repoPath);
+			gitUri = new GitUri(uri);
 
 			openWorkspace(uri, {
-				location: args.openInNewWindow ? OpenWorkspaceLocation.NewWindow : OpenWorkspaceLocation.AddToWorkspace,
+				location: args.openInNewWindow ? 'newWindow' : 'addToWorkspace',
 				name: `${basename(gitUri.repoPath!)} @ ${gitUri.shortSha}`,
 			});
 
 			if (!args.openInNewWindow) {
-				void executeCoreCommand(CoreCommands.FocusFilesExplorer);
+				void executeCoreCommand('workbench.files.action.focusFilesExplorer');
 			}
 		} catch (ex) {
 			Logger.error(ex, 'BrowseRepoAtRevisionCommand');
-			void Messages.showGenericErrorMessage('Unable to open the repository at the specified revision');
+			void showGenericErrorMessage('Unable to open the repository at the specified revision');
 		}
 	}
 }

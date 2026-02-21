@@ -1,74 +1,100 @@
 import { ThemeIcon, TreeItem, TreeItemCollapsibleState } from 'vscode';
-import { ViewFilesLayout } from '../../configuration';
-import { GitUri } from '../../git/gitUri';
-import { GitFile } from '../../git/models';
-import { makeHierarchical } from '../../system/array';
-import { gate } from '../../system/decorators/gate';
-import { debug } from '../../system/decorators/log';
-import { map } from '../../system/iterable';
-import { joinPaths, normalizePath } from '../../system/path';
-import { cancellable, PromiseCancelledError } from '../../system/promise';
-import { sortCompare } from '../../system/string';
-import { ViewsWithCommits } from '../viewBase';
-import { FileNode, FolderNode } from './folderNode';
-import { ResultsFileNode } from './resultsFileNode';
-import { ContextValues, ViewNode } from './viewNode';
+import type { FilesComparison } from '../../git/actions/commit.js';
+import { GitUri } from '../../git/gitUri.js';
+import type { GitFile } from '../../git/models/file.js';
+import type { FilesQueryResults } from '../../git/queryResults.js';
+import { makeHierarchical } from '../../system/array.js';
+import { trace } from '../../system/decorators/log.js';
+import { map } from '../../system/iterable.js';
+import { joinPaths, normalizePath } from '../../system/path.js';
+import { cancellable, PromiseCancelledError } from '../../system/promise.js';
+import { pluralize, sortCompare } from '../../system/string.js';
+import type { ViewsWithCommits } from '../viewBase.js';
+import { ContextValues, getViewNodeId, ViewNode } from './abstract/viewNode.js';
+import type { FileNode } from './folderNode.js';
+import { FolderNode } from './folderNode.js';
+import { ResultsFileNode } from './resultsFileNode.js';
 
-export interface FilesQueryResults {
-	label: string;
-	files: GitFile[] | undefined;
-	filtered?: {
-		filter: 'left' | 'right';
-		files: GitFile[];
-	};
+type State = {
+	filter: FilesQueryFilter | undefined;
+};
+
+export const enum FilesQueryFilter {
+	Left = 0,
+	Right = 1,
 }
 
-export class ResultsFilesNode extends ViewNode<ViewsWithCommits> {
+interface Options {
+	expand: boolean;
+	timeout: false | number;
+}
+
+export class ResultsFilesNode extends ViewNode<'results-files', ViewsWithCommits, State> {
+	private readonly _options: Options;
+
 	constructor(
 		view: ViewsWithCommits,
-		parent: ViewNode,
+		protected override parent: ViewNode,
 		public readonly repoPath: string,
 		public readonly ref1: string,
 		public readonly ref2: string,
 		private readonly _filesQuery: () => Promise<FilesQueryResults>,
 		private readonly direction: 'ahead' | 'behind' | undefined,
-		private readonly _options: {
-			expand?: boolean;
-		} = {},
+		options?: Partial<Options>,
 	) {
-		super(GitUri.fromRepoPath(repoPath), view, parent);
+		super('results-files', GitUri.fromRepoPath(repoPath), view, parent);
 
-		this._options = { expand: true, ..._options };
+		if (this.direction != null) {
+			this.updateContext({ branchStatusUpstreamType: this.direction });
+		}
+		this._uniqueId = getViewNodeId(this.type, this.context);
+		this._options = { expand: true, timeout: 100, ...options };
 	}
 
 	override get id(): string {
-		return `${this.parent!.id}:results:files`;
+		return this._uniqueId;
 	}
 
-	private _filter: 'left' | 'right' | false = false;
-	get filter(): 'left' | 'right' | false {
-		return this._filter;
+	get filter(): FilesQueryFilter | undefined {
+		return this.getState('filter');
 	}
-	set filter(value: 'left' | 'right' | false) {
-		if (this._filter === value) return;
+	set filter(value: FilesQueryFilter | undefined) {
+		if (this.filter === value) return;
 
-		this._filter = value;
+		this.storeState('filter', value, true);
 		this._filterResults = undefined;
 
 		void this.triggerChange(false);
 	}
 
 	get filterable(): boolean {
-		return this.filtered || (this.ref1 !== this.ref2 && this.direction === undefined);
+		return this.filter != null || (this.ref1 !== this.ref2 && this.direction === undefined);
 	}
 
-	get filtered(): boolean {
-		return Boolean(this.filter);
+	async getFilesComparison(): Promise<FilesComparison> {
+		const { files } = await this.getFilesQueryResults();
+		return {
+			files: files ?? [],
+			repoPath: this.repoPath,
+			ref1: this.ref1,
+			ref2: this.ref2,
+		};
+	}
+
+	private getFilterContextValue(): string {
+		switch (this.filter) {
+			case FilesQueryFilter.Left:
+				return '+filtered~left';
+			case FilesQueryFilter.Right:
+				return '+filtered~right';
+			default:
+				return '';
+		}
 	}
 
 	async getChildren(): Promise<ViewNode[]> {
 		const results = await this.getFilesQueryResults();
-		const files = (this.filtered ? results.filtered?.files : undefined) ?? results.files;
+		const files = (this.filter != null ? results.filtered?.get(this.filter) : undefined) ?? results.files;
 		if (files == null) return [];
 
 		let children: FileNode[] = [
@@ -78,7 +104,7 @@ export class ResultsFilesNode extends ViewNode<ViewsWithCommits> {
 			),
 		];
 
-		if (this.view.config.files.layout !== ViewFilesLayout.List) {
+		if (this.view.config.files.layout !== 'list') {
 			const hierarchy = makeHierarchical(
 				children,
 				n => n.uri.relativePath.split('/'),
@@ -86,7 +112,7 @@ export class ResultsFilesNode extends ViewNode<ViewsWithCommits> {
 				this.view.config.files.compact,
 			);
 
-			const root = new FolderNode(this.view, this, this.repoPath, '', hierarchy);
+			const root = new FolderNode(this.view, this, hierarchy, this.repoPath, '', undefined);
 			children = root.getChildren() as FileNode[];
 		} else {
 			children.sort((a, b) => a.priority - b.priority || sortCompare(a.label!, b.label!));
@@ -97,29 +123,55 @@ export class ResultsFilesNode extends ViewNode<ViewsWithCommits> {
 
 	async getTreeItem(): Promise<TreeItem> {
 		let label;
+		let description;
 		let icon;
 		let files: GitFile[] | undefined;
 		let state;
+		let tooltip;
 
+		const filter = this.filter;
 		try {
-			const results = await cancellable(this.getFilesQueryResults(), 100);
+			const results = await cancellable(
+				this.getFilesQueryResults(),
+				this._options.timeout === false ? undefined : this._options.timeout,
+			);
 			label = results.label;
-			files = (this.filtered ? results.filtered?.files : undefined) ?? results.files;
-
-			if (this.filtered && results.filtered == null) {
-				label = 'files changed';
-				icon = new ThemeIcon('ellipsis');
+			if (filter == null && results.stats != null) {
+				description = `${pluralize('addition', results.stats.additions)} (+), ${pluralize(
+					'deletion',
+					results.stats.deletions,
+				)} (-)${results.stats.approximated ? ' *approximated' : ''}`;
+				tooltip = `${label}, ${description}`;
 			}
 
-			state =
-				files == null || files.length === 0
-					? TreeItemCollapsibleState.None
-					: this._options.expand
-					? TreeItemCollapsibleState.Expanded
-					: TreeItemCollapsibleState.Collapsed;
+			if (filter != null) {
+				description = 'Filtered';
+				tooltip = `${label} &mdash; ${description}`;
+				files = results.filtered?.get(filter);
+				if (files == null) {
+					label = 'files changed';
+					icon = new ThemeIcon('ellipsis');
+					// Need to use Collapsed before we have results or the item won't show up in the view until the children are awaited
+					// https://github.com/microsoft/vscode/issues/54806 & https://github.com/microsoft/vscode/issues/62214
+					state = TreeItemCollapsibleState.Collapsed;
+
+					void this._filterResults?.then(() => queueMicrotask(() => this.triggerChange(false)));
+				}
+			} else {
+				files = results.files;
+			}
+
+			if (state === undefined) {
+				state =
+					files == null || files.length === 0
+						? TreeItemCollapsibleState.None
+						: this._options.expand
+							? TreeItemCollapsibleState.Expanded
+							: TreeItemCollapsibleState.Collapsed;
+			}
 		} catch (ex) {
 			if (ex instanceof PromiseCancelledError) {
-				ex.promise.then(() => queueMicrotask(() => this.triggerChange(false)));
+				void ex.promise.then(() => queueMicrotask(() => this.triggerChange(false)));
 			}
 
 			label = 'files changed';
@@ -130,22 +182,25 @@ export class ResultsFilesNode extends ViewNode<ViewsWithCommits> {
 		}
 
 		const item = new TreeItem(
-			`${this.filtered && files != null ? `Showing ${files.length} of ` : ''}${label}`,
+			`${filter != null && files != null ? `Showing ${files.length} of ` : ''}${label}`,
 			state,
 		);
+		item.description = description;
 		item.id = this.id;
 		item.iconPath = icon;
-		item.contextValue = `${ContextValues.ResultsFiles}${this.filterable ? '+filterable' : ''}${
-			this.filtered ? `+filtered~${this.filter}` : ''
-		}`;
+		item.contextValue = `${ContextValues.ResultsFiles}${
+			this.filterable ? '+filterable' : ''
+		}${this.getFilterContextValue()}`;
+		item.tooltip = tooltip;
 
 		return item;
 	}
 
-	@gate()
-	@debug()
-	override refresh(reset: boolean = false) {
+	@trace()
+	override refresh(reset: boolean = false): void {
 		if (!reset) return;
+
+		this.deleteState('filter');
 
 		this._filterResults = undefined;
 		this._filesQueryResults = this._filesQuery();
@@ -154,57 +209,46 @@ export class ResultsFilesNode extends ViewNode<ViewsWithCommits> {
 	private _filesQueryResults: Promise<FilesQueryResults> | undefined;
 	private _filterResults: Promise<void> | undefined;
 
-	async getFilesQueryResults() {
-		if (this._filesQueryResults === undefined) {
-			this._filesQueryResults = this._filesQuery();
-		}
+	private async getFilesQueryResults() {
+		this._filesQueryResults ??= this._filesQuery();
 
 		const results = await this._filesQueryResults;
 		if (
 			results.files == null ||
 			!this.filterable ||
-			this.filter === false ||
-			results.filtered?.filter === this.filter
+			this.filter == null ||
+			results.filtered?.get(this.filter) != null
 		) {
 			return results;
 		}
 
-		if (this._filterResults === undefined) {
-			this._filterResults = this.filterResults(this.filter, results);
-		}
-
+		this._filterResults ??= this.filterResults(this.filter, results);
 		await this._filterResults;
 
 		return results;
 	}
 
-	private async filterResults(filter: 'left' | 'right', results: FilesQueryResults) {
+	private async filterResults(filter: FilesQueryFilter, results: FilesQueryResults) {
 		let filterTo: Set<string> | undefined;
 
-		const ref = this.filter === 'left' ? this.ref2 : this.ref1;
+		const ref = this.filter === FilesQueryFilter.Left ? this.ref2 : this.ref1;
 
-		const mergeBase = await this.view.container.git.getMergeBase(
-			this.repoPath,
-			this.ref1 || 'HEAD',
-			this.ref2 || 'HEAD',
-		);
+		const svc = this.view.container.git.getRepositoryService(this.repoPath);
+
+		const mergeBase = await svc.refs.getMergeBase(this.ref1 || 'HEAD', this.ref2 || 'HEAD');
 		if (mergeBase != null) {
-			const files = await this.view.container.git.getDiffStatus(this.uri.repoPath!, `${mergeBase}..${ref}`);
+			const files = await svc.diff.getDiffStatus(`${mergeBase}..${ref}`);
 			if (files != null) {
 				filterTo = new Set<string>(files.map(f => f.path));
 			}
 		} else {
-			const commit = await this.view.container.git.getCommit(this.uri.repoPath!, ref || 'HEAD');
-			if (commit?.files != null) {
-				filterTo = new Set<string>(commit.files.map(f => f.path));
+			const commit = await svc.commits.getCommit(ref || 'HEAD');
+			if (commit?.fileset?.files != null) {
+				filterTo = new Set<string>(commit.fileset?.files.map(f => f.path));
 			}
 		}
 
-		if (filterTo == null) return;
-
-		results.filtered = {
-			filter: filter,
-			files: results.files!.filter(f => filterTo!.has(f.path)),
-		};
+		results.filtered ??= new Map();
+		results.filtered.set(filter, filterTo == null ? [] : results.files!.filter(f => filterTo.has(f.path)));
 	}
 }

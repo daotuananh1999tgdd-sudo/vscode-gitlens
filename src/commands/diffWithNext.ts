@@ -1,69 +1,68 @@
-import { Range, TextDocumentShowOptions, TextEditor, Uri } from 'vscode';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { GitCommit } from '../git/models';
-import { Logger } from '../logger';
-import { Messages } from '../messages';
-import { command, executeCommand } from '../system/command';
-import { ActiveEditorCommand, CommandContext, getCommandUri } from './base';
-import { DiffWithCommandArgs } from './diffWith';
+import type { TextDocumentShowOptions, TextEditor, Uri } from 'vscode';
+import type { Container } from '../container.js';
+import type { DiffRange } from '../git/gitProvider.js';
+import { GitUri } from '../git/gitUri.js';
+import type { GitCommit } from '../git/models/commit.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { command, executeCommand } from '../system/-webview/command.js';
+import { selectionToDiffRange } from '../system/-webview/vscode/editors.js';
+import { getTabUris, getVisibleTabs } from '../system/-webview/vscode/tabs.js';
+import { Logger } from '../system/logger.js';
+import { areUrisEqual } from '../system/uri.js';
+import { ActiveEditorCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
+import type { DiffWithCommandArgs } from './diffWith.js';
 
 export interface DiffWithNextCommandArgs {
 	commit?: GitCommit;
-	range?: Range;
 
-	inDiffLeftEditor?: boolean;
-	line?: number;
+	range?: DiffRange;
 	showOptions?: TextDocumentShowOptions;
 }
 
 @command()
 export class DiffWithNextCommand extends ActiveEditorCommand {
 	constructor(private readonly container: Container) {
-		super([Commands.DiffWithNext, Commands.DiffWithNextInDiffLeft, Commands.DiffWithNextInDiffRight]);
+		super(['gitlens.diffWithNext', 'gitlens.diffWithNext:editor/title', 'gitlens.diffWithNext:key']);
 	}
 
-	protected override preExecute(context: CommandContext, args?: DiffWithNextCommandArgs) {
-		if (context.command === Commands.DiffWithNextInDiffLeft) {
-			args = { ...args, inDiffLeftEditor: true };
-		}
-
-		return this.execute(context.editor, context.uri, args);
-	}
-
-	async execute(editor?: TextEditor, uri?: Uri, args?: DiffWithNextCommandArgs) {
+	async execute(editor?: TextEditor, uri?: Uri, args?: DiffWithNextCommandArgs): Promise<void> {
 		uri = getCommandUri(uri, editor);
 		if (uri == null) return;
 
 		args = { ...args };
-		if (args.line == null) {
-			args.line = editor?.selection.active.line ?? 0;
+		args.range ??= selectionToDiffRange(editor?.selection);
+
+		let isInLeftSideOfDiffEditor = false;
+
+		if (args.commit == null) {
+			// Figure out if we are in a diff editor and if so, which side
+			const [tab] = getVisibleTabs(uri);
+			if (tab != null) {
+				const uris = getTabUris(tab);
+				// If there is an original, then we are in a diff editor -- modified is right, original is left
+				if (uris.original != null && areUrisEqual(uri, uris.original)) {
+					isInLeftSideOfDiffEditor = true;
+				}
+			}
 		}
 
 		const gitUri = args.commit?.getGitUri() ?? (await GitUri.fromUri(uri));
 		try {
-			const diffUris = await this.container.git.getNextComparisonUris(
-				gitUri.repoPath!,
+			const diffUris = await this.container.git.getRepositoryService(gitUri.repoPath!).diff.getNextComparisonUris(
 				gitUri,
 				gitUri.sha,
 				// If we are in the left-side of the diff editor, we need to skip forward 1 more revision
-				args.inDiffLeftEditor ? 1 : 0,
+				isInLeftSideOfDiffEditor ? 1 : 0,
 			);
 
-			if (diffUris == null || diffUris.next == null) return;
+			if (diffUris?.next == null) return;
 
-			void (await executeCommand<DiffWithCommandArgs>(Commands.DiffWith, {
+			void (await executeCommand<DiffWithCommandArgs>('gitlens.diffWith', {
 				repoPath: diffUris.current.repoPath,
-				lhs: {
-					sha: diffUris.current.sha ?? '',
-					uri: diffUris.current.documentUri(),
-				},
-				rhs: {
-					sha: diffUris.next.sha ?? '',
-					uri: diffUris.next.documentUri(),
-				},
-				line: args.line,
+				lhs: { sha: diffUris.current.sha ?? '', uri: diffUris.current.documentUri },
+				rhs: { sha: diffUris.next.sha ?? '', uri: diffUris.next.documentUri },
+				range: args.range,
 				showOptions: args.showOptions,
 			}));
 		} catch (ex) {
@@ -72,7 +71,7 @@ export class DiffWithNextCommand extends ActiveEditorCommand {
 				'DiffWithNextCommand',
 				`getNextDiffUris(${gitUri.repoPath}, ${gitUri.fsPath}, ${gitUri.sha})`,
 			);
-			void Messages.showGenericErrorMessage('Unable to open compare');
+			void showGenericErrorMessage('Unable to open compare');
 		}
 	}
 }

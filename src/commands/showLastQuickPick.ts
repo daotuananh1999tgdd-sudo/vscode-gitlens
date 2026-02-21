@@ -1,18 +1,17 @@
 import { commands } from 'vscode';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { Logger } from '../logger';
-import { Messages } from '../messages';
-import { command } from '../system/command';
-import { Command, getLastCommand } from './base';
+import type { Container } from '../container.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { command } from '../system/-webview/command.js';
+import { Logger } from '../system/logger.js';
+import { getLastCommand, GlCommandBase } from './commandBase.js';
 
 @command()
-export class ShowLastQuickPickCommand extends Command {
+export class ShowLastQuickPickCommand extends GlCommandBase {
 	constructor(private readonly container: Container) {
-		super(Commands.ShowLastQuickPick);
+		super('gitlens.showLastQuickPick');
 	}
 
-	execute() {
+	execute(): Thenable<unknown> {
 		const command = getLastCommand();
 		if (command === undefined) return Promise.resolve(undefined);
 
@@ -20,7 +19,7 @@ export class ShowLastQuickPickCommand extends Command {
 			return commands.executeCommand(command.command, ...command.args);
 		} catch (ex) {
 			Logger.error(ex, 'ShowLastQuickPickCommand');
-			return Messages.showGenericErrorMessage('Unable to show last quick pick');
+			return showGenericErrorMessage('Unable to show last quick pick');
 		}
 	}
 }

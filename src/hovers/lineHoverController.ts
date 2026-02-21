@@ -1,24 +1,16 @@
-import {
-	CancellationToken,
-	ConfigurationChangeEvent,
-	Disposable,
-	Hover,
-	languages,
-	Position,
-	Range,
-	TextDocument,
-	TextEditor,
-	Uri,
-	window,
-} from 'vscode';
-import { UriComparer } from '../comparers';
-import { configuration, FileAnnotationType } from '../configuration';
-import { Container } from '../container';
-import { Logger } from '../logger';
-import { debug } from '../system/decorators/log';
-import { once } from '../system/event';
-import { LinesChangeEvent } from '../trackers/gitLineTracker';
-import { Hovers } from './hovers';
+import type { CancellationToken, ConfigurationChangeEvent, Position, TextDocument, TextEditor, Uri } from 'vscode';
+import { Disposable, Hover, languages, Range, window } from 'vscode';
+import type { Container } from '../container.js';
+import { configuration } from '../system/-webview/configuration.js';
+import { isTrackableTextEditor } from '../system/-webview/vscode/editors.js';
+import { trace } from '../system/decorators/log.js';
+import { once } from '../system/event.js';
+import { Logger } from '../system/logger.js';
+import { areUrisEqual } from '../system/uri.js';
+import type { LinesChangeEvent } from '../trackers/lineTracker.js';
+import { changesMessage, detailsMessage } from './hovers.js';
+
+const maxSmallIntegerV8 = 2 ** 30 - 1; // Max number that can be stored in V8's smis (small integers)
 
 export class LineHoverController implements Disposable {
 	private readonly _disposable: Disposable;
@@ -32,7 +24,7 @@ export class LineHoverController implements Disposable {
 		);
 	}
 
-	dispose() {
+	dispose(): void {
 		this.unregister();
 
 		this.container.lineTracker.unsubscribe(this);
@@ -48,7 +40,8 @@ export class LineHoverController implements Disposable {
 			return;
 		}
 
-		if (this.container.config.hovers.enabled && this.container.config.hovers.currentLine.enabled) {
+		const cfg = configuration.get('hovers');
+		if (cfg.enabled && cfg.currentLine.enabled) {
 			this.container.lineTracker.subscribe(
 				this,
 				this.container.lineTracker.onDidChangeActiveLines(this.onActiveLinesChanged, this),
@@ -61,13 +54,12 @@ export class LineHoverController implements Disposable {
 		}
 	}
 
-	@debug<LineHoverController['onActiveLinesChanged']>({
-		args: {
-			0: e =>
-				`editor=${e.editor?.document.uri.toString(true)}, selections=${e.selections
-					?.map(s => `[${s.anchor}-${s.active}]`)
-					.join(',')}, pending=${Boolean(e.pending)}, reason=${e.reason}`,
-		},
+	@trace({
+		args: e => ({
+			e: `editor=${e.editor?.document.uri.toString(true)}, selections=${e.selections
+				?.map(s => `[${s.anchor}-${s.active}]`)
+				.join(',')}, pending=${Boolean(e.pending)}, reason=${e.reason}`,
+		}),
 	})
 	private onActiveLinesChanged(e: LinesChangeEvent) {
 		if (e.pending) return;
@@ -83,17 +75,18 @@ export class LineHoverController implements Disposable {
 		this.register(e.editor);
 	}
 
-	@debug<LineHoverController['provideDetailsHover']>({
-		args: {
-			0: document => Logger.toLoggable(document.uri),
-			1: position => `${position.line}:${position.character}`,
-			2: false,
-		},
+	@trace({
+		args: (document, position) => ({
+			document: Logger.toLoggable(document.uri),
+			position: `${position.line}:${position.character}`,
+		}),
+		exit: r => (r != null ? 'provided' : 'skipped'),
+		onlyExit: true,
 	})
 	async provideDetailsHover(
 		document: TextDocument,
 		position: Position,
-		_token: CancellationToken,
+		token: CancellationToken,
 	): Promise<Hover | undefined> {
 		if (!this.container.lineTracker.includes(position.line)) return undefined;
 
@@ -101,18 +94,25 @@ export class LineHoverController implements Disposable {
 		const commit = lineState?.commit;
 		if (commit == null) return undefined;
 
+		const cfg = configuration.get('hovers');
+
 		// Avoid double annotations if we are showing the whole-file hover blame annotations
-		if (this.container.config.hovers.annotations.details) {
+		if (cfg.annotations.details) {
 			const fileAnnotations = await this.container.fileAnnotations.getAnnotationType(window.activeTextEditor);
-			if (fileAnnotations === FileAnnotationType.Blame) return undefined;
+			if (fileAnnotations === 'blame') return undefined;
 		}
 
-		const wholeLine = this.container.config.hovers.currentLine.over === 'line';
+		const wholeLine = cfg.currentLine.over === 'line';
 		// If we aren't showing the hover over the whole line, make sure the annotation is on
 		if (!wholeLine && this.container.lineAnnotations.suspended) return undefined;
 
 		const range = document.validateRange(
-			new Range(position.line, wholeLine ? 0 : Number.MAX_SAFE_INTEGER, position.line, Number.MAX_SAFE_INTEGER),
+			new Range(
+				position.line,
+				wholeLine ? position.character : maxSmallIntegerV8,
+				position.line,
+				maxSmallIntegerV8,
+			),
 		);
 		if (!wholeLine && range.start.character !== position.character) return undefined;
 
@@ -121,31 +121,29 @@ export class LineHoverController implements Disposable {
 		const commitLine = commit.lines.find(l => l.line === line) ?? commit.lines[0];
 		editorLine = commitLine.originalLine - 1;
 
-		const trackedDocument = await this.container.tracker.get(document);
-		if (trackedDocument == null) return undefined;
+		const trackedDocument = await this.container.documentTracker.get(document);
+		if (trackedDocument == null || token.isCancellationRequested) return undefined;
 
-		const message = await Hovers.detailsMessage(
-			commit,
-			trackedDocument.uri,
-			editorLine,
-			this.container.config.hovers.detailsMarkdownFormat,
-			this.container.config.defaultDateFormat,
-			{
-				autolinks: this.container.config.hovers.autolinks.enabled,
-				pullRequests: {
-					enabled: this.container.config.hovers.pullRequests.enabled,
-				},
-			},
-		);
+		const message =
+			(await detailsMessage(this.container, commit, trackedDocument.uri, editorLine, {
+				autolinks: cfg.autolinks.enabled,
+				cancellation: token,
+				dateFormat: configuration.get('defaultDateFormat'),
+				format: cfg.detailsMarkdownFormat,
+				pullRequests: cfg.pullRequests.enabled,
+				timeout: 250,
+				sourceName: 'editor:hover',
+			})) ?? 'Cancelled';
 		return new Hover(message, range);
 	}
 
-	@debug<LineHoverController['provideChangesHover']>({
-		args: {
-			0: document => Logger.toLoggable(document.uri),
-			1: position => `${position.line}:${position.character}`,
-			2: false,
-		},
+	@trace({
+		args: (document, position) => ({
+			document: Logger.toLoggable(document.uri),
+			position: `${position.line}:${position.character}`,
+		}),
+		exit: r => (r != null ? 'provided' : 'skipped'),
+		onlyExit: true,
 	})
 	async provideChangesHover(
 		document: TextDocument,
@@ -158,29 +156,38 @@ export class LineHoverController implements Disposable {
 		const commit = lineState?.commit;
 		if (commit == null) return undefined;
 
+		const cfg = configuration.get('hovers');
+
 		// Avoid double annotations if we are showing the whole-file hover blame annotations
-		if (this.container.config.hovers.annotations.changes) {
+		if (cfg.annotations.changes) {
 			const fileAnnotations = await this.container.fileAnnotations.getAnnotationType(window.activeTextEditor);
-			if (fileAnnotations === FileAnnotationType.Blame) return undefined;
+			if (fileAnnotations === 'blame') return undefined;
 		}
 
-		const wholeLine = this.container.config.hovers.currentLine.over === 'line';
+		const wholeLine = cfg.currentLine.over === 'line';
 		// If we aren't showing the hover over the whole line, make sure the annotation is on
 		if (!wholeLine && this.container.lineAnnotations.suspended) return undefined;
 
 		const range = document.validateRange(
-			new Range(position.line, wholeLine ? 0 : Number.MAX_SAFE_INTEGER, position.line, Number.MAX_SAFE_INTEGER),
+			new Range(
+				position.line,
+				wholeLine ? position.character : maxSmallIntegerV8,
+				position.line,
+				maxSmallIntegerV8,
+			),
 		);
 		if (!wholeLine && range.start.character !== position.character) return undefined;
 
-		const trackedDocument = await this.container.tracker.get(document);
+		const trackedDocument = await this.container.documentTracker.get(document);
 		if (trackedDocument == null) return undefined;
 
-		const message = await Hovers.changesMessage(
+		const message = await changesMessage(
+			this.container,
 			commit,
 			trackedDocument.uri,
 			position.line,
 			trackedDocument.document,
+			'editor:hover',
 		);
 		if (message == null) return undefined;
 
@@ -188,15 +195,15 @@ export class LineHoverController implements Disposable {
 	}
 
 	private isRegistered(uri: Uri | undefined) {
-		return this._hoverProviderDisposable != null && UriComparer.equals(this._uri, uri);
+		return this._hoverProviderDisposable != null && areUrisEqual(this._uri, uri);
 	}
 
 	private register(editor: TextEditor | undefined) {
 		this.unregister();
 
-		if (editor == null) return;
+		if (editor == null || !isTrackableTextEditor(editor)) return;
 
-		const cfg = this.container.config.hovers;
+		const cfg = configuration.get('hovers');
 		if (!cfg.enabled || !cfg.currentLine.enabled || (!cfg.currentLine.details && !cfg.currentLine.changes)) return;
 
 		this._uri = editor.document.uri;

@@ -1,58 +1,71 @@
 import { TreeItem, TreeItemCollapsibleState } from 'vscode';
-import { GitUri } from '../../git/gitUri';
-import { GitLog } from '../../git/models';
-import { gate } from '../../system/decorators/gate';
-import { debug } from '../../system/decorators/log';
-import { map } from '../../system/iterable';
-import { cancellable, PromiseCancelledError } from '../../system/promise';
-import { ViewsWithCommits } from '../viewBase';
-import { AutolinkedItemsNode } from './autolinkedItemsNode';
-import { CommitNode } from './commitNode';
-import { LoadMoreNode } from './common';
-import { insertDateMarkers } from './helpers';
-import { FilesQueryResults, ResultsFilesNode } from './resultsFilesNode';
-import { ContextValues, PageableViewNode, ViewNode } from './viewNode';
+import type { TreeViewNodeTypes } from '../../constants.views.js';
+import { GitUri } from '../../git/gitUri.js';
+import { isStash } from '../../git/models/commit.js';
+import type { GitRevisionRange } from '../../git/models/revision.js';
+import type { CommitsQueryResults, FilesQueryResults } from '../../git/queryResults.js';
+import { getChangesForChangelog } from '../../git/utils/-webview/log.utils.js';
+import type { AIGenerateChangelogChanges } from '../../plus/ai/actions/generateChangelog.js';
+import { configuration } from '../../system/-webview/configuration.js';
+import { trace } from '../../system/decorators/log.js';
+import { map } from '../../system/iterable.js';
+import { getLoggableName } from '../../system/logger.js';
+import { getNewLogScope } from '../../system/logger.scope.js';
+import type { Deferred } from '../../system/promise.js';
+import { defer, pauseOnCancelOrTimeout } from '../../system/promise.js';
+import type { ViewsWithCommits } from '../viewBase.js';
+import type { PageableViewNode } from './abstract/viewNode.js';
+import { ContextValues, getViewNodeId, ViewNode } from './abstract/viewNode.js';
+import { AutolinkedItemsNode } from './autolinkedItemsNode.js';
+import { CommitNode } from './commitNode.js';
+import { LoadMoreNode, MessageNode } from './common.js';
+import { ContributorsNode } from './contributorsNode.js';
+import { ResultsFilesNode } from './resultsFilesNode.js';
+import { StashNode } from './stashNode.js';
+import { insertDateMarkers } from './utils/-webview/node.utils.js';
 
-export interface CommitsQueryResults {
-	readonly label: string;
-	readonly log: GitLog | undefined;
-	readonly hasMore: boolean;
-	more?(limit: number | undefined): Promise<void>;
+interface Options {
+	autolinks: boolean;
+	expand: boolean;
+	description?: string;
 }
 
-export class ResultsCommitsNode<View extends ViewsWithCommits = ViewsWithCommits>
-	extends ViewNode<View>
+export class ResultsCommitsNodeBase<Type extends TreeViewNodeTypes, View extends ViewsWithCommits = ViewsWithCommits>
+	extends ViewNode<Type, View>
 	implements PageableViewNode
 {
+	limit: number | undefined;
+
+	private readonly _options: Options;
+
 	constructor(
+		type: Type,
 		view: View,
-		parent: ViewNode,
+		protected override readonly parent: ViewNode,
 		public readonly repoPath: string,
 		private _label: string,
-		private readonly _results: {
+		protected readonly _results: {
 			query: (limit: number | undefined) => Promise<CommitsQueryResults>;
-			comparison?: { ref1: string; ref2: string };
+			comparison?: { ref1: string; ref2: string; range: GitRevisionRange };
 			deferred?: boolean;
 			direction?: 'ahead' | 'behind';
-			files?: {
-				ref1: string;
-				ref2: string;
-				query: () => Promise<FilesQueryResults>;
-			};
+			files?: { ref1: string; ref2: string; query: () => Promise<FilesQueryResults> };
 		},
-		private readonly _options: {
-			id?: string;
-			description?: string;
-			expand?: boolean;
-		} = {},
-		splatted?: boolean,
+		options?: Partial<Options>,
 	) {
-		super(GitUri.fromRepoPath(repoPath), view, parent);
+		super(type, GitUri.fromRepoPath(repoPath), view, parent);
 
-		if (splatted != null) {
-			this.splatted = splatted;
+		if (_results.direction != null) {
+			this.updateContext({ branchStatusUpstreamType: _results.direction, repoPath: repoPath });
 		}
-		this._options = { expand: true, ..._options };
+		this._uniqueId = getViewNodeId(this.type, this.context);
+		this.limit = this.view.getNodeLastKnownLimit(this);
+
+		this._options = { autolinks: true, expand: true, ...options };
+	}
+
+	override get id(): string {
+		return this._uniqueId;
 	}
 
 	get ref1(): string | undefined {
@@ -63,24 +76,51 @@ export class ResultsCommitsNode<View extends ViewsWithCommits = ViewsWithCommits
 		return this._results.comparison?.ref2;
 	}
 
-	override get id(): string {
-		return `${this.parent!.id}:results:commits${this._options.id ? `:${this._options.id}` : ''}`;
+	private get isComparisonFiltered(): boolean | undefined {
+		return this.context.comparisonFiltered;
 	}
 
+	private _onChildrenCompleted: Deferred<void> | undefined;
+
 	async getChildren(): Promise<ViewNode[]> {
+		this._onChildrenCompleted?.cancel();
+		this._onChildrenCompleted = defer<void>();
+
 		const { log } = await this.getCommitsQueryResults();
-		if (log == null) return [];
+		if (!log?.commits.size) {
+			this._onChildrenCompleted?.fulfill();
+			return [new MessageNode(this.view, this, 'No results found')];
+		}
 
-		const getBranchAndTagTips = await this.view.container.git.getBranchesAndTagsTipsFn(this.uri.repoPath);
-		const children = [];
+		const getBranchAndTagTips = await this.view.container.git
+			.getRepositoryService(this.uri.repoPath!)
+			.getBranchesAndTagsTipsLookup();
 
-		const remote = await this.view.container.git.getRichRemoteProvider(this.repoPath);
-		if (remote != null) {
-			children.push(new AutolinkedItemsNode(this.view, this, this.uri.repoPath!, remote, log));
+		const children: ViewNode[] = [];
+		if (this._options.autolinks) {
+			children.push(new AutolinkedItemsNode(this.view, this, this.uri.repoPath!, log, this._expandAutolinks));
+		}
+		this._expandAutolinks = false;
+
+		if (this._results.comparison?.range && this.view.config.showComparisonContributors) {
+			children.push(
+				new ContributorsNode(
+					this.uri,
+					this.view,
+					this,
+					this.view.container.git.getRepository(this.uri.repoPath!)!,
+					{
+						icon: false,
+						ref: this._results.comparison?.range,
+						stats: this.view.config.showContributorsStatistics,
+					},
+				),
+			);
 		}
 
 		const { files } = this._results;
-		if (files != null) {
+		// Can't support showing files when commits are filtered
+		if (files != null && !this.isComparisonFiltered) {
 			children.push(
 				new ResultsFilesNode(
 					this.view,
@@ -90,20 +130,22 @@ export class ResultsCommitsNode<View extends ViewsWithCommits = ViewsWithCommits
 					files.ref2,
 					files.query,
 					this._results.direction,
-					{
-						expand: false,
-					},
+					{ expand: false },
 				),
 			);
 		}
 
-		const options = { expand: this._options.expand && log.count === 1 };
+		const allowFilteredFiles = log.searchFilters?.files ?? false;
 
 		children.push(
 			...insertDateMarkers(
-				map(
-					log.commits.values(),
-					c => new CommitNode(this.view, this, c, undefined, undefined, getBranchAndTagTips, options),
+				map(log.commits.values(), c =>
+					isStash(c)
+						? new StashNode(this.view, this, c, { allowFilteredFiles: allowFilteredFiles, icon: true })
+						: new CommitNode(this.view, this, c, undefined, undefined, getBranchAndTagTips, {
+								allowFilteredFiles: allowFilteredFiles,
+								expand: this._options.expand && log.count === 1,
+							}),
 				),
 				this,
 				undefined,
@@ -112,9 +154,10 @@ export class ResultsCommitsNode<View extends ViewsWithCommits = ViewsWithCommits
 		);
 
 		if (log.hasMore) {
-			children.push(new LoadMoreNode(this.view, this, children[children.length - 1]));
+			children.push(new LoadMoreNode(this.view, this, children.at(-1)!));
 		}
 
+		this._onChildrenCompleted?.fulfill();
 		return children;
 	}
 
@@ -126,19 +169,40 @@ export class ResultsCommitsNode<View extends ViewsWithCommits = ViewsWithCommits
 			label = this._label;
 			state = TreeItemCollapsibleState.Collapsed;
 		} else {
-			try {
-				let log;
-				({ label, log } = await cancellable(this.getCommitsQueryResults(), 100));
-				state =
-					log == null || log.count === 0
-						? TreeItemCollapsibleState.None
-						: this._options.expand || log.count === 1
+			let log;
+
+			const result = await pauseOnCancelOrTimeout(this.getCommitsQueryResults(), undefined, 100);
+			if (!result.paused) {
+				state = this._options.expand ? TreeItemCollapsibleState.Expanded : TreeItemCollapsibleState.Collapsed;
+
+				({ label, log } = result.value);
+
+				state = !log?.commits.size
+					? TreeItemCollapsibleState.None
+					: this._options.expand //|| log.count === 1
 						? TreeItemCollapsibleState.Expanded
 						: TreeItemCollapsibleState.Collapsed;
-			} catch (ex) {
-				if (ex instanceof PromiseCancelledError) {
-					ex.promise.then(() => this.triggerChange(false));
-				}
+			} else {
+				queueMicrotask(async () => {
+					const scope = getNewLogScope(`${getLoggableName(this)}.getTreeItem`, true);
+					try {
+						if (this._onChildrenCompleted?.promise != null) {
+							const timeout = new Promise<void>(resolve => {
+								setTimeout(() => {
+									scope?.error(undefined, 'onChildrenCompleted promise timed out after 30s');
+									resolve();
+								}, 30000); // 30 second timeout
+							});
+
+							await Promise.race([this._onChildrenCompleted.promise, timeout]);
+						}
+
+						void (await result.value);
+						this.view.triggerNodeChange(this.parent);
+					} catch (ex) {
+						scope?.error(ex, 'Failed awaiting children completion');
+					}
+				});
 
 				// Need to use Collapsed before we have results or the item won't show up in the view until the children are awaited
 				// https://github.com/microsoft/vscode/issues/54806 & https://github.com/microsoft/vscode/issues/62214
@@ -155,48 +219,85 @@ export class ResultsCommitsNode<View extends ViewsWithCommits = ViewsWithCommits
 		return item;
 	}
 
-	@gate()
-	@debug()
-	override refresh(reset: boolean = false) {
+	@trace()
+	override refresh(reset: boolean = false): void {
 		if (reset) {
-			this._commitsQueryResults = undefined;
+			this._commitsQueryResultsPromise = undefined;
 			void this.getCommitsQueryResults();
 		}
 	}
 
-	private _commitsQueryResults: Promise<CommitsQueryResults> | undefined;
+	private _commitsQueryResultsPromise: Promise<CommitsQueryResults> | undefined;
 	private async getCommitsQueryResults() {
-		if (this._commitsQueryResults == null) {
-			this._commitsQueryResults = this._results.query(
-				this.limit ?? this.view.container.config.advanced.maxSearchItems,
+		if (this._commitsQueryResultsPromise == null) {
+			this._commitsQueryResultsPromise = this._results.query(
+				this.limit ?? configuration.get('advanced.maxSearchItems'),
 			);
-			const results = await this._commitsQueryResults;
+			const results = await this._commitsQueryResultsPromise;
+
 			this._hasMore = results.hasMore;
 
 			if (this._results.deferred) {
 				this._results.deferred = false;
 
-				void this.triggerChange(false);
+				void this.parent.triggerChange(false);
 			}
 		}
 
-		return this._commitsQueryResults;
+		return this._commitsQueryResultsPromise;
 	}
 
 	private _hasMore = true;
-	get hasMore() {
+	get hasMore(): boolean {
 		return this._hasMore;
 	}
 
-	limit: number | undefined = this.view.getNodeLastKnownLimit(this);
-	async loadMore(limit?: number) {
+	private _expandAutolinks: boolean = false;
+	async loadMore(limit?: number, context?: Record<string, unknown>): Promise<void> {
 		const results = await this.getCommitsQueryResults();
-		if (results == null || !results.hasMore) return;
+		if (!results?.hasMore) return;
 
+		if (context != null && 'expandAutolinks' in context) {
+			this._expandAutolinks = Boolean(context.expandAutolinks);
+		}
 		await results.more?.(limit ?? this.view.config.pageItemLimit);
 
 		this.limit = results.log?.count;
 
 		void this.triggerChange(false);
+	}
+
+	async getChangesForChangelog(): Promise<AIGenerateChangelogChanges> {
+		const range: AIGenerateChangelogChanges['range'] = {
+			base: { ref: this.ref1!, label: `\`${this.ref1}\`` },
+			head: { ref: this.ref2!, label: `\`${this.ref2}\`` },
+		};
+
+		const { log } = await this.getCommitsQueryResults();
+		if (log == null) return { changes: [], range: range };
+
+		return getChangesForChangelog(this.view.container, range, log);
+	}
+}
+
+export class ResultsCommitsNode<View extends ViewsWithCommits = ViewsWithCommits> extends ResultsCommitsNodeBase<
+	'results-commits',
+	View
+> {
+	constructor(
+		view: View,
+		parent: ViewNode,
+		repoPath: string,
+		label: string,
+		results: {
+			query: (limit: number | undefined) => Promise<CommitsQueryResults>;
+			comparison?: { ref1: string; ref2: string; range: GitRevisionRange };
+			deferred?: boolean;
+			direction?: 'ahead' | 'behind';
+			files?: { ref1: string; ref2: string; query: () => Promise<FilesQueryResults> };
+		},
+		options?: Partial<Options>,
+	) {
+		super('results-commits', view, parent, repoPath, label, results, options);
 	}
 }

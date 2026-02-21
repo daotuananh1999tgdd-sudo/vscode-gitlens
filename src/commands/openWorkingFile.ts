@@ -1,13 +1,14 @@
-import { Range, TextDocumentShowOptions, TextEditor, Uri, window } from 'vscode';
-import { FileAnnotationType } from '../configuration';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { Logger } from '../logger';
-import { Messages } from '../messages';
-import { command } from '../system/command';
-import { findOrOpenEditor } from '../system/utils';
-import { ActiveEditorCommand, getCommandUri } from './base';
+import type { TextDocumentShowOptions, TextEditor, Uri } from 'vscode';
+import { Range, window } from 'vscode';
+import type { FileAnnotationType } from '../config.js';
+import type { Container } from '../container.js';
+import { GitUri, isGitUri } from '../git/gitUri.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { command } from '../system/-webview/command.js';
+import { getOrOpenTextEditor } from '../system/-webview/vscode/editors.js';
+import { Logger } from '../system/logger.js';
+import { ActiveEditorCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
 
 export interface OpenWorkingFileCommandArgs {
 	uri?: Uri;
@@ -19,14 +20,17 @@ export interface OpenWorkingFileCommandArgs {
 @command()
 export class OpenWorkingFileCommand extends ActiveEditorCommand {
 	constructor(private readonly container: Container) {
-		super([Commands.OpenWorkingFile, Commands.OpenWorkingFileInDiffLeft, Commands.OpenWorkingFileInDiffRight]);
+		super([
+			'gitlens.openWorkingFile',
+			'gitlens.openWorkingFile:command',
+			'gitlens.openWorkingFile:editor/context',
+			'gitlens.openWorkingFile:editor/title',
+		]);
 	}
 
-	async execute(editor: TextEditor, uri?: Uri, args?: OpenWorkingFileCommandArgs) {
+	async execute(editor: TextEditor, uri?: Uri, args?: OpenWorkingFileCommandArgs): Promise<void> {
 		args = { ...args };
-		if (args.line == null) {
-			args.line = editor?.selection.active.line;
-		}
+		args.line ??= editor?.selection.active.line;
 
 		try {
 			if (args.uri == null) {
@@ -37,8 +41,10 @@ export class OpenWorkingFileCommand extends ActiveEditorCommand {
 			}
 
 			args.uri = await GitUri.fromUri(uri);
-			if (GitUri.is(args.uri) && args.uri.sha) {
-				const workingUri = await this.container.git.getWorkingUri(args.uri.repoPath!, args.uri);
+			if (isGitUri(args.uri) && args.uri.sha) {
+				const workingUri = await this.container.git
+					.getRepositoryService(args.uri.repoPath!)
+					.getWorkingUri(args.uri);
 				if (workingUri === undefined) {
 					void window.showWarningMessage(
 						'Unable to open working file. File could not be found in the working tree',
@@ -57,7 +63,7 @@ export class OpenWorkingFileCommand extends ActiveEditorCommand {
 				args.showOptions.selection = new Range(args.line, 0, args.line, 0);
 			}
 
-			const e = await findOrOpenEditor(args.uri, { ...args.showOptions, throwOnError: true });
+			const e = await getOrOpenTextEditor(args.uri, { ...args.showOptions, throwOnError: true });
 			if (args.annotationType === undefined) return;
 
 			void (await this.container.fileAnnotations.show(e, args.annotationType, {
@@ -65,7 +71,7 @@ export class OpenWorkingFileCommand extends ActiveEditorCommand {
 			}));
 		} catch (ex) {
 			Logger.error(ex, 'OpenWorkingFileCommand');
-			void Messages.showGenericErrorMessage('Unable to open working file');
+			void showGenericErrorMessage('Unable to open working file');
 		}
 	}
 }

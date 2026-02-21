@@ -1,131 +1,128 @@
-import { hrtime } from '@env/hrtime';
-import { GlyphChars } from '../constants';
-import { LogCorrelationContext, Logger, LogLevel } from '../logger';
-import { getNextCorrelationId } from '../system/decorators/log';
+import { hrtime } from '@env/hrtime.js';
+import type { LogLevel } from './logger.constants.js';
+import type { LogProvider } from './logger.js';
+import { defaultLogProvider } from './logger.js';
+import type { ScopedLogger } from './logger.scope.js';
+import { getNewLogScope } from './logger.scope.js';
 
-type StopwatchLogOptions = { message?: string; suffix?: string };
+(Symbol as any).dispose ??= Symbol('Symbol.dispose');
+(Symbol as any).asyncDispose ??= Symbol('Symbol.asyncDispose');
+
+type StopwatchLogLevel = Exclude<LogLevel, 'off'>;
+type StopwatchLogOptions = {
+	level?: StopwatchLogLevel;
+	message?: string;
+	suffix?: string;
+	onlyExit?: true;
+};
 type StopwatchOptions = {
 	log?: boolean | StopwatchLogOptions;
-	logLevel?: StopwatchLogLevel;
+	provider?: LogProvider;
+	scopeLabel?: string;
 };
-type StopwatchLogLevel = Exclude<LogLevel, LogLevel.Off>;
 
-export class Stopwatch {
-	private readonly instance = `[${String(getNextCorrelationId()).padStart(5)}] `;
+export class Stopwatch implements Disposable {
+	private readonly logScope: ScopedLogger;
 	private readonly logLevel: StopwatchLogLevel;
-	private time: [number, number];
+	private readonly logProvider: LogProvider;
 
-	constructor(public readonly context: string | LogCorrelationContext, options?: StopwatchOptions, ...params: any[]) {
-		let cc;
-		if (typeof context !== 'string') {
-			cc = context;
-			context = '';
-			this.instance = '';
-		}
+	private _time: [number, number];
+	get startTime(): [number, number] {
+		return this._time;
+	}
 
-		let logOptions: StopwatchLogOptions | undefined;
-		if (typeof options?.log === 'boolean') {
-			logOptions = options.log ? {} : undefined;
+	private _stopped = false;
+
+	constructor(scope: string | ScopedLogger | undefined, options?: StopwatchOptions, ...params: any[]) {
+		this.logScope =
+			scope != null && typeof scope !== 'string'
+				? scope
+				: getNewLogScope(scope ?? '', false, options?.scopeLabel);
+
+		const log = options?.log;
+		let logEntry: { message?: string; suffix?: string } | undefined;
+		if (log == null || log === true) {
+			logEntry = {};
+		} else if (log === false) {
+			logEntry = undefined;
 		} else {
-			logOptions = options?.log ?? {};
+			logEntry = log.onlyExit ? undefined : log;
 		}
 
-		this.logLevel = options?.logLevel ?? LogLevel.Info;
-		this.time = hrtime();
+		this.logLevel = (typeof log === 'object' ? log.level : undefined) ?? 'debug';
+		this.logProvider = options?.provider ?? defaultLogProvider;
+		this._time = hrtime();
 
-		if (logOptions != null) {
-			if (!Logger.enabled(this.logLevel)) return;
+		if (logEntry != null) {
+			if (!this.logProvider.enabled(this.logLevel)) return;
 
 			if (params.length) {
-				log(
+				this.logProvider.log(
 					this.logLevel,
-					cc,
-					`${this.instance}${context}${logOptions.message ?? ''}${logOptions.suffix ?? ''}`,
+					this.logScope,
+					`${logEntry.message ?? ''}${logEntry.suffix ?? ''}`,
 					...params,
 				);
 			} else {
-				log(
-					this.logLevel,
-					cc,
-					`${this.instance}${context}${logOptions.message ?? ''}${logOptions.suffix ?? ''}`,
-				);
+				this.logProvider.log(this.logLevel, this.logScope, `${logEntry.message ?? ''}${logEntry.suffix ?? ''}`);
 			}
 		}
 	}
 
-	log(options?: StopwatchLogOptions): void {
-		this.logCore(this.context, options, false);
+	[Symbol.dispose](): void {
+		this.stop();
 	}
 
-	restart(options?: StopwatchLogOptions): void {
-		this.logCore(this.context, options, true);
-		this.time = hrtime();
+	elapsed(): number {
+		const [secs, nanosecs] = hrtime(this._time);
+		return secs * 1000 + Math.floor(nanosecs / 1000000);
 	}
 
-	stop(options?: StopwatchLogOptions): void {
+	log(options?: { message?: string; suffix?: string }): void {
+		this.logCore(options, false);
+	}
+
+	restart(options?: { message?: string; suffix?: string }): void {
+		this.logCore(options, true);
+		this._time = hrtime();
+		this._stopped = false;
+	}
+
+	stop(options?: { message?: string; suffix?: string }): void {
+		if (this._stopped) return;
+
 		this.restart(options);
+		this._stopped = true;
 	}
 
-	private logCore(
-		context: string | LogCorrelationContext,
-		options: StopwatchLogOptions | undefined,
-		logTotalElapsed: boolean,
-	): void {
-		if (!Logger.enabled(this.logLevel)) return;
-
-		let cc;
-		if (typeof context !== 'string') {
-			cc = context;
-			context = '';
-		}
+	private logCore(options: { message?: string; suffix?: string } | undefined, logTotalElapsed: boolean): void {
+		if (!this.logProvider.enabled(this.logLevel)) return;
 
 		if (!logTotalElapsed) {
-			log(this.logLevel, cc, `${this.instance}${context}${options?.message ?? ''}${options?.suffix ?? ''}`);
+			this.logProvider.log(this.logLevel, this.logScope, `${options?.message ?? ''}${options?.suffix ?? ''}`);
 
 			return;
 		}
 
-		const [secs, nanosecs] = hrtime(this.time);
+		const [secs, nanosecs] = hrtime(this._time);
 		const ms = secs * 1000 + Math.floor(nanosecs / 1000000);
 
-		const prefix = `${this.instance}${context}${options?.message ?? ''}`;
-		log(
-			ms > 250 ? LogLevel.Warn : this.logLevel,
-			cc,
-			`${prefix ? `${prefix} ${GlyphChars.Dot} ` : ''}${ms} ms${options?.suffix ?? ''}`,
+		const prefix = options?.message ?? '';
+		this.logProvider.log(
+			ms > 250 ? 'warn' : this.logLevel,
+			this.logScope,
+			`${prefix ? `${prefix} ` : ''}[${ms}ms]${options?.suffix ?? ''}`,
 		);
-	}
-
-	private static readonly watches = new Map<string, Stopwatch>();
-
-	static start(key: string, options?: StopwatchOptions, ...params: any[]): void {
-		Stopwatch.watches.get(key)?.log();
-		Stopwatch.watches.set(key, new Stopwatch(key, options, ...params));
-	}
-
-	static log(key: string, options?: StopwatchLogOptions): void {
-		Stopwatch.watches.get(key)?.log(options);
-	}
-
-	static stop(key: string, options?: StopwatchLogOptions): void {
-		Stopwatch.watches.get(key)?.stop(options);
-		Stopwatch.watches.delete(key);
 	}
 }
 
-function log(logLevel: StopwatchLogLevel, cc: LogCorrelationContext | undefined, message: string, ...params: any[]) {
-	switch (logLevel) {
-		case LogLevel.Error:
-			Logger.error('', cc, message, ...params);
-			break;
-		case LogLevel.Warn:
-			Logger.warn(cc, message, ...params);
-			break;
-		case LogLevel.Info:
-			Logger.log(cc, message, ...params);
-			break;
-		default:
-			Logger.debug(cc, message, ...params);
-			break;
-	}
+export function maybeStopWatch(
+	scope: string | ScopedLogger | undefined,
+	options?: StopwatchOptions,
+	...params: any[]
+): Stopwatch | undefined {
+	const level = (typeof options?.log === 'object' ? options.log.level : undefined) ?? 'info';
+	return (options?.provider ?? defaultLogProvider).enabled(level)
+		? new Stopwatch(scope, options, ...params)
+		: undefined;
 }

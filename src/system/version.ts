@@ -1,4 +1,4 @@
-import { compareIgnoreCase } from './string';
+import { compareIgnoreCase } from './string.js';
 
 declare type VersionComparisonResult = -1 | 0 | 1;
 
@@ -47,4 +47,27 @@ export function fromString(version: string): Version {
 	const [ver, pre] = version.split('-');
 	const [major, minor, patch] = ver.split('.');
 	return from(major, minor, patch, pre);
+}
+
+export function satisfies(
+	v: string | Version | null | undefined,
+	requirement: `${'=' | '>' | '>=' | '<' | '<='} ${string}`,
+): boolean {
+	if (v == null) return false;
+
+	const [op, version] = requirement.split(' ');
+
+	if (op === '=') {
+		return compare(v, version) === 0;
+	} else if (op === '>') {
+		return compare(v, version) > 0;
+	} else if (op === '>=') {
+		return compare(v, version) >= 0;
+	} else if (op === '<') {
+		return compare(v, version) < 0;
+	} else if (op === '<=') {
+		return compare(v, version) <= 0;
+	}
+
+	throw new Error(`Unknown operator: ${op}`);
 }

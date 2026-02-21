@@ -1,54 +1,60 @@
-import { Disposable, TreeItem, TreeItemCollapsibleState, Uri, window } from 'vscode';
-import { configuration } from '../../configuration';
-import type { GitUri } from '../../git/gitUri';
-import {
-	GitBranch,
-	GitLog,
-	GitRevision,
-	RepositoryChange,
-	RepositoryChangeComparisonMode,
-	RepositoryChangeEvent,
-	RepositoryFileSystemChangeEvent,
-} from '../../git/models';
-import { Logger } from '../../logger';
-import { gate } from '../../system/decorators/gate';
-import { debug } from '../../system/decorators/log';
-import { memoize } from '../../system/decorators/memoize';
-import { filterMap, flatMap, map, uniqueBy } from '../../system/iterable';
-import { basename } from '../../system/path';
-import { FileHistoryView } from '../fileHistoryView';
-import { CommitNode } from './commitNode';
-import { LoadMoreNode, MessageNode } from './common';
-import { FileHistoryTrackerNode } from './fileHistoryTrackerNode';
-import { FileRevisionAsCommitNode } from './fileRevisionAsCommitNode';
-import { insertDateMarkers } from './helpers';
-import { RepositoryNode } from './repositoryNode';
-import { ContextValues, PageableViewNode, SubscribeableViewNode, ViewNode } from './viewNode';
+import { Disposable, TreeItem, TreeItemCollapsibleState, window } from 'vscode';
+import type { GitUri } from '../../git/gitUri.js';
+import type { GitBranch } from '../../git/models/branch.js';
+import type { GitLog } from '../../git/models/log.js';
+import type { RepositoryChangeEvent, RepositoryFileSystemChangeEvent } from '../../git/models/repository.js';
+import { deletedOrMissing } from '../../git/models/revision.js';
+import { getBranchAheadRange } from '../../git/utils/-webview/branch.utils.js';
+import { configuration } from '../../system/-webview/configuration.js';
+import { getFolderGlobUri } from '../../system/-webview/path.js';
+import { gate } from '../../system/decorators/gate.js';
+import { trace } from '../../system/decorators/log.js';
+import { memoize } from '../../system/decorators/memoize.js';
+import { weakEvent } from '../../system/event.js';
+import { filterMap, flatMap, map, some, uniqueBy } from '../../system/iterable.js';
+import { getLoggableName } from '../../system/logger.js';
+import { maybeStartLoggableScope } from '../../system/logger.scope.js';
+import { basename } from '../../system/path.js';
+import { getSettledValue } from '../../system/promise.js';
+import type { FileHistoryView } from '../fileHistoryView.js';
+import { SubscribeableViewNode } from './abstract/subscribeableViewNode.js';
+import type { PageableViewNode, ViewNode } from './abstract/viewNode.js';
+import { ContextValues, getViewNodeId } from './abstract/viewNode.js';
+import { CommitNode } from './commitNode.js';
+import { LoadMoreNode, MessageNode } from './common.js';
+import { ContributorNode } from './contributorNode.js';
+import { FileHistoryTrackerNode } from './fileHistoryTrackerNode.js';
+import { FileRevisionAsCommitNode } from './fileRevisionAsCommitNode.js';
+import { insertDateMarkers } from './utils/-webview/node.utils.js';
 
-export class FileHistoryNode extends SubscribeableViewNode<FileHistoryView> implements PageableViewNode {
-	static key = ':history:file';
-	static getId(repoPath: string, uri: string): string {
-		return `${RepositoryNode.getId(repoPath)}${this.key}(${uri})`;
-	}
-
-	protected override splatted = true;
+export class FileHistoryNode
+	extends SubscribeableViewNode<'file-history', FileHistoryView>
+	implements PageableViewNode
+{
+	limit: number | undefined;
 
 	constructor(
 		uri: GitUri,
 		view: FileHistoryView,
-		parent: ViewNode,
+		protected override readonly parent: ViewNode,
 		private readonly folder: boolean,
 		private readonly branch: GitBranch | undefined,
 	) {
-		super(uri, view, parent);
+		super('file-history', uri, view, parent);
+
+		if (branch != null) {
+			this.updateContext({ branch: branch });
+		}
+		this._uniqueId = getViewNodeId(`${this.type}+${uri.toString()}`, this.context);
+		this.limit = this.view.getNodeLastKnownLimit(this);
+	}
+
+	override get id(): string {
+		return this._uniqueId;
 	}
 
 	override toClipboard(): string {
 		return this.uri.fileName;
-	}
-
-	override get id(): string {
-		return FileHistoryNode.getId(this.uri.repoPath!, this.uri.toString(true));
 	}
 
 	async getChildren(): Promise<ViewNode[]> {
@@ -56,89 +62,13 @@ export class FileHistoryNode extends SubscribeableViewNode<FileHistoryView> impl
 			this.parent instanceof FileHistoryTrackerNode && !this.parent.followingEditor ? ' (pinned)' : ''
 		}`;
 
-		const children: ViewNode[] = [];
-
-		const range = this.branch != null ? await this.view.container.git.getBranchAheadRange(this.branch) : undefined;
-		const [log, fileStatuses, currentUser, getBranchAndTagTips, unpublishedCommits] = await Promise.all([
-			this.getLog(),
-			this.uri.sha == null
-				? this.view.container.git.getStatusForFiles(this.uri.repoPath!, this.getPathOrGlob())
-				: undefined,
-			this.uri.sha == null ? this.view.container.git.getCurrentUser(this.uri.repoPath!) : undefined,
-			this.branch != null
-				? this.view.container.git.getBranchesAndTagsTipsFn(this.uri.repoPath, this.branch.name)
-				: undefined,
-			range
-				? this.view.container.git.getLogRefsOnly(this.uri.repoPath!, {
-						limit: 0,
-						ref: range,
-				  })
-				: undefined,
-		]);
-
-		if (fileStatuses?.length) {
-			if (this.folder) {
-				// Combine all the working/staged changes into single pseudo commits
-				const commits = map(
-					uniqueBy(
-						flatMap(fileStatuses, f => f.getPseudoCommits(this.view.container, currentUser)),
-						c => c.sha,
-						(original, c) => original.with({ files: { files: [...original.files!, ...c.files!] } }),
-					),
-					commit => new CommitNode(this.view, this, commit),
-				);
-				children.push(...commits);
-			} else {
-				const [file] = fileStatuses;
-				const commits = file.getPseudoCommits(this.view.container, currentUser);
-				if (commits.length) {
-					children.push(
-						...commits.map(commit => new FileRevisionAsCommitNode(this.view, this, file, commit)),
-					);
-				}
-			}
+		if (this.view.mode === 'contributors') {
+			return this.getContributors();
 		}
-
-		if (log != null) {
-			children.push(
-				...insertDateMarkers(
-					filterMap(log.commits.values(), c =>
-						this.folder
-							? new CommitNode(
-									this.view,
-									this,
-									c,
-									unpublishedCommits?.has(c.ref),
-									this.branch,
-									undefined,
-									{
-										expand: false,
-									},
-							  )
-							: c.file != null
-							? new FileRevisionAsCommitNode(this.view, this, c.file, c, {
-									branch: this.branch,
-									getBranchAndTagTips: getBranchAndTagTips,
-									unpublished: unpublishedCommits?.has(c.ref),
-							  })
-							: undefined,
-					),
-					this,
-				),
-			);
-
-			if (log.hasMore) {
-				children.push(new LoadMoreNode(this.view, this, children[children.length - 1]));
-			}
-		}
-
-		if (children.length === 0) return [new MessageNode(this.view, this, 'No file history could be found.')];
-		return children;
+		return this.getCommits();
 	}
 
 	getTreeItem(): TreeItem {
-		this.splatted = false;
-
 		const label = this.label;
 		const item = new TreeItem(label, TreeItemCollapsibleState.Expanded);
 		item.contextValue = ContextValues.FileHistory;
@@ -154,37 +84,38 @@ export class FileHistoryNode extends SubscribeableViewNode<FileHistoryView> impl
 		return item;
 	}
 
-	get label() {
+	get label(): string {
 		// Check if this is a base folder
 		if (this.folder && this.uri.fileName === '') {
 			return `${basename(this.uri.path)}${
 				this.uri.sha
-					? ` ${this.uri.sha === GitRevision.deletedOrMissing ? this.uri.shortSha : `(${this.uri.shortSha})`}`
+					? ` ${this.uri.sha === deletedOrMissing ? this.uri.shortSha : `(${this.uri.shortSha})`}`
 					: ''
 			}`;
 		}
 
 		return `${this.uri.fileName}${
-			this.uri.sha
-				? ` ${this.uri.sha === GitRevision.deletedOrMissing ? this.uri.shortSha : `(${this.uri.shortSha})`}`
-				: ''
+			this.uri.sha ? ` ${this.uri.sha === deletedOrMissing ? this.uri.shortSha : `(${this.uri.shortSha})`}` : ''
 		}`;
 	}
 
-	@debug()
-	protected subscribe() {
+	@trace()
+	protected subscribe(): Disposable | undefined {
 		const repo = this.view.container.git.getRepository(this.uri);
 		if (repo == null) return undefined;
 
 		const subscription = Disposable.from(
-			repo.onDidChange(this.onRepositoryChanged, this),
-			repo.onDidChangeFileSystem(this.onFileSystemChanged, this),
-			repo.startWatchingFileSystem(),
-			configuration.onDidChange(e => {
-				if (configuration.changed(e, 'advanced.fileHistoryFollowsRenames')) {
-					this.view.resetNodeLastKnownLimit(this);
-				}
-			}),
+			weakEvent(repo.onDidChange, this.onRepositoryChanged, this),
+			weakEvent(repo.onDidChangeFileSystem, this.onFileSystemChanged, this, [repo.watchFileSystem()]),
+			weakEvent(
+				configuration.onDidChange,
+				e => {
+					if (configuration.changed(e, 'advanced.fileHistoryFollowsRenames')) {
+						this.view.resetNodeLastKnownLimit(this);
+					}
+				},
+				this,
+			),
 		);
 
 		return subscription;
@@ -195,76 +126,68 @@ export class FileHistoryNode extends SubscribeableViewNode<FileHistoryView> impl
 	}
 
 	private onRepositoryChanged(e: RepositoryChangeEvent) {
-		if (
-			!e.changed(
-				RepositoryChange.Index,
-				RepositoryChange.Heads,
-				RepositoryChange.Remotes,
-				RepositoryChange.RemoteProviders,
-				RepositoryChange.Status,
-				RepositoryChange.Unknown,
-				RepositoryChangeComparisonMode.Any,
-			)
-		) {
+		if (!e.changed('index', 'heads', 'remotes', 'remoteProviders', 'pausedOp', 'unknown')) {
 			return;
 		}
 
-		Logger.debug(`FileHistoryNode.onRepositoryChanged(${e.toString()}); triggering node refresh`);
+		using scope = maybeStartLoggableScope(`${getLoggableName(this)}.onRepositoryChanged(e=${e.toString()})`);
+		scope?.trace('triggering node refresh');
 
 		void this.triggerChange(true);
 	}
 
 	private onFileSystemChanged(e: RepositoryFileSystemChangeEvent) {
 		if (this.folder) {
-			if (!e.uris.some(uri => uri.fsPath.startsWith(this.uri.fsPath))) return;
-		} else if (!e.uris.some(uri => uri.toString() === this.uri.toString())) {
+			if (!some(e.uris, uri => uri.fsPath.startsWith(this.uri.fsPath))) return;
+		} else if (!e.uris.has(this.uri)) {
 			return;
 		}
 
-		Logger.debug(`FileHistoryNode.onFileSystemChanged(${this.uri.toString(true)}); triggering node refresh`);
+		using scope = maybeStartLoggableScope(
+			`${getLoggableName(this)}.onFileSystemChanged(e=${this.uri.toString(true)})`,
+		);
+		scope?.trace('triggering node refresh');
 
 		void this.triggerChange(true);
 	}
 
-	@gate()
-	@debug()
-	override refresh(reset?: boolean) {
+	@trace()
+	override refresh(reset: boolean = false): void | { cancel: boolean } | Promise<void | { cancel: boolean }> {
 		if (reset) {
 			this._log = undefined;
 		}
+		return super.refresh(reset);
 	}
 
 	private _log: GitLog | undefined;
 	private async getLog() {
-		if (this._log == null) {
-			this._log = await this.view.container.git.getLogForFile(this.uri.repoPath, this.getPathOrGlob(), {
+		this._log ??= await this.view.container.git
+			.getRepositoryService(this.uri.repoPath!)
+			.commits.getLogForPath(this.uri, this.uri.sha, {
 				limit: this.limit ?? this.view.config.pageItemLimit,
-				ref: this.uri.sha,
+				isFolder: this.folder,
 			});
-		}
-
 		return this._log;
 	}
 
 	@memoize()
 	private getPathOrGlob() {
-		return this.folder ? Uri.joinPath(this.uri, '*') : this.uri;
+		return this.folder ? getFolderGlobUri(this.uri) : this.uri;
 	}
 
-	get hasMore() {
+	get hasMore(): boolean {
 		return this._log?.hasMore ?? true;
 	}
 
-	limit: number | undefined = this.view.getNodeLastKnownLimit(this);
 	@gate()
-	async loadMore(limit?: number | { until?: any }) {
+	async loadMore(limit?: number | { until?: any }): Promise<void> {
 		let log = await window.withProgress(
 			{
 				location: { viewId: this.view.id },
 			},
 			() => this.getLog(),
 		);
-		if (log == null || !log.hasMore) return;
+		if (!log?.hasMore) return;
 
 		log = await log.more?.(limit ?? this.view.config.pageItemLimit);
 		if (this._log === log) return;
@@ -274,5 +197,125 @@ export class FileHistoryNode extends SubscribeableViewNode<FileHistoryView> impl
 
 		// Needs to force if splatted, since the parent node will cancel the refresh (since it thinks nothing changed)
 		void this.triggerChange(false, this.splatted);
+	}
+
+	private async getContributors(): Promise<ViewNode[]> {
+		if (this.uri.repoPath == null) return [];
+
+		const svc = this.view.container.git.getRepositoryService(this.uri.repoPath);
+		const result = await svc.contributors.getContributors(this.uri.sha ?? undefined, {
+			pathspec: this.folder
+				? svc.getRelativePath(this.getPathOrGlob(), this.uri.repoPath)
+				: svc.getRelativePath(this.uri, this.uri.repoPath),
+			stats: true,
+		});
+		if (!result?.contributors.length) return [new MessageNode(this.view, this, 'No contributors could be found.')];
+
+		const children = result.contributors.map(
+			contributor =>
+				new ContributorNode(this.uri, this.view, this, contributor, {
+					presence: undefined,
+					ref: this.uri.sha,
+					showMergeCommits: configuration.get('advanced.fileHistoryShowMergeCommits'),
+					pathspec: { uri: this.uri, isFolder: this.folder },
+				}),
+		);
+
+		return children;
+	}
+
+	private async getCommits(): Promise<ViewNode[]> {
+		if (this.uri.repoPath == null) return [];
+
+		const children: ViewNode[] = [];
+
+		const svc = this.view.container.git.getRepositoryService(this.uri.repoPath);
+		const range = this.branch != null ? await getBranchAheadRange(svc, this.branch) : undefined;
+		const [logResult, fileStatusesResult, currentUserResult, getBranchAndTagTipsResult, unpublishedCommitsResult] =
+			await Promise.allSettled([
+				this.getLog(),
+				this.uri.sha == null ? svc.status.getStatusForPath?.(this.uri) : undefined,
+				this.uri.sha == null ? svc.config.getCurrentUser() : undefined,
+				svc.getBranchesAndTagsTipsLookup(this.branch?.name),
+				range ? svc.commits.getLogShas(range, { limit: 0 }) : undefined,
+			]);
+
+		const currentUser = getSettledValue(currentUserResult);
+		const fileStatuses = getSettledValue(fileStatusesResult);
+
+		if (fileStatuses?.length) {
+			if (this.folder) {
+				const relativePath = svc.getRelativePath(this.getPathOrGlob(), this.uri.repoPath);
+				// Combine all the working/staged changes into single pseudo commits
+				const commits = map(
+					uniqueBy(
+						flatMap(fileStatuses, f => f.getPseudoCommits(this.view.container, currentUser)),
+						c => c.sha,
+						(original, c) =>
+							original.with({
+								fileset: {
+									files: [...(original.fileset?.files ?? []), ...(c.fileset?.files ?? [])],
+									filtered: {
+										files: [
+											...(original.fileset?.filtered?.files ?? []),
+											...(c.fileset?.filtered?.files ?? []),
+										],
+										pathspec: relativePath,
+									},
+								},
+							}),
+					),
+					commit => new CommitNode(this.view, this, commit),
+				);
+				children.push(...commits);
+			} else {
+				const [file] = fileStatuses;
+				const commits = file.getPseudoCommits(this.view.container, currentUser);
+				if (commits.length) {
+					children.push(
+						...commits.map(commit => new FileRevisionAsCommitNode(this.view, this, file, commit)),
+					);
+				}
+			}
+		}
+
+		const getBranchAndTagTips = getSettledValue(getBranchAndTagTipsResult);
+		const unpublishedCommits = new Set(getSettledValue(unpublishedCommitsResult));
+
+		const log = getSettledValue(logResult);
+		if (log != null) {
+			children.push(
+				...insertDateMarkers(
+					filterMap(log.commits.values(), c =>
+						this.folder
+							? new CommitNode(
+									this.view,
+									this,
+									c,
+									unpublishedCommits?.has(c.ref),
+									this.branch,
+									getBranchAndTagTips,
+									{ allowFilteredFiles: true, expand: false },
+								)
+							: c.file != null
+								? new FileRevisionAsCommitNode(this.view, this, c.file, c, {
+										branch: this.branch,
+										getBranchAndTagTips: getBranchAndTagTips,
+										unpublished: unpublishedCommits?.has(c.ref),
+									})
+								: undefined,
+					),
+					this,
+				),
+			);
+
+			if (log.hasMore) {
+				children.push(new LoadMoreNode(this.view, this, children.at(-1)!));
+			}
+		}
+
+		if (!children.length) return [new MessageNode(this.view, this, 'No file history could be found.')];
+
+		return children;
 	}
 }

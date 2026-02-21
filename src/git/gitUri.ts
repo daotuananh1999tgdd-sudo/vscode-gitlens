@@ -1,19 +1,25 @@
 import { Uri } from 'vscode';
-import { decodeUtf8Hex, encodeUtf8Hex } from '@env/hex';
-import { UriComparer } from '../comparers';
-import { Schemes } from '../constants';
-import { Container } from '../container';
-import { Logger } from '../logger';
-import type { GitHubAuthorityMetadata } from '../premium/remotehub';
-import { debug } from '../system/decorators/log';
-import { memoize } from '../system/decorators/memoize';
-import { formatPath } from '../system/formatPath';
-import { basename, getBestPath, normalizePath, relativeDir, splitPath } from '../system/path';
-// import { CharCode } from '../system/string';
-import type { RevisionUriData } from './gitProvider';
-import { GitFile, GitRevision } from './models';
+import { realpath } from '@env/fs.js';
+import { getQueryDataFromScmGitUri } from '../@types/vscode.git.uri.js';
+import { Schemes } from '../constants.js';
+import { Container } from '../container.js';
+import type { GitHubAuthorityMetadata } from '../plus/remotehub.js';
+import { configuration } from '../system/-webview/configuration.js';
+import { formatPath } from '../system/-webview/formatPath.js';
+import { getBestPath, relativeDir, splitPath } from '../system/-webview/path.js';
+import { isVirtualUri } from '../system/-webview/vscode/uris.js';
+import { trace } from '../system/decorators/log.js';
+import { memoize } from '../system/decorators/memoize.js';
+import { arePathsEqual, basename, normalizePath } from '../system/path.js';
+import type { UriComponents } from '../system/uri.js';
+import { areUrisEqual } from '../system/uri.js';
+import type { RevisionUriData } from './gitProvider.js';
+import { decodeGitLensRevisionUriAuthority, decodeRemoteHubAuthority } from './gitUri.authority.js';
+import type { GitFile } from './models/file.js';
+import { uncommittedStaged } from './models/revision.js';
+import { isUncommitted, isUncommittedStaged, shortenRevision } from './utils/revision.utils.js';
 
-const slash = 47; //CharCode.Slash;
+const slash = 47; //slash;
 
 export interface GitCommitish {
 	fileName?: string;
@@ -21,106 +27,135 @@ export interface GitCommitish {
 	sha?: string;
 }
 
-interface UriComponents {
-	scheme?: string;
-	authority?: string;
-	path?: string;
-	query?: string;
-	fragment?: string;
-}
-
 interface UriEx {
 	new (): Uri;
 	new (scheme: string, authority: string, path: string, query: string, fragment: string): Uri;
 	// Use this ctor, because vscode doesn't validate it
-	new (components: UriComponents): Uri;
+	// eslint-disable-next-line @typescript-eslint/unified-signatures
+	new (components: Partial<UriComponents>): Uri;
 }
 
+/**
+ * Extends VS Code's `Uri` with Git-specific context: `repoPath`, `sha`, and `submoduleSha`.
+ *
+ * GitUri instances exist in two forms:
+ * - **file:// with object properties** — created by `fromFile`, `fromRepoPath`, `fromUri`, or the constructor
+ *   with a `GitCommitish`. The URI scheme stays as-is (usually `file:`), but `sha` and `repoPath` are
+ *   carried as instance properties for internal use within GitLens.
+ * - **gitlens:// with encoded authority** — created by `GitProvider.getRevisionUri()`. Git metadata is
+ *   hex-encoded in the URI authority for use with VS Code's `FileSystemProvider` and document APIs.
+ *
+ * Use `getRevisionUriFromGitUri()` on `GitProviderService` to convert a file:// GitUri to a gitlens:// revision URI.
+ * Use {@link documentUri} for the URI as VS Code sees the document (preserves original scheme).
+ * Use {@link workingFileUri} for the file:// URI of this file in the working tree.
+ */
 export class GitUri extends (Uri as any as UriEx) {
-	private static readonly _unknown = new GitUri();
-	static get unknown() {
-		return this._unknown;
-	}
-
-	static is(uri: any): uri is GitUri {
-		return uri instanceof GitUri;
-	}
-
 	readonly repoPath?: string;
 	readonly sha?: string;
+	readonly submoduleSha?: string;
 
 	constructor(uri?: Uri);
+	// eslint-disable-next-line @typescript-eslint/unified-signatures
 	constructor(uri: Uri, commit: GitCommitish);
+	// eslint-disable-next-line @typescript-eslint/unified-signatures
 	constructor(uri: Uri, repoPath: string | undefined);
 	constructor(uri?: Uri, commitOrRepoPath?: GitCommitish | string) {
 		if (uri == null) {
 			super({ scheme: 'unknown' });
-
 			return;
 		}
 
 		if (uri.scheme === Schemes.GitLens) {
-			super({
-				scheme: uri.scheme,
-				authority: uri.authority,
-				path: uri.path,
-				query: uri.query,
-				fragment: uri.fragment,
-			});
-
-			const metadata = decodeGitLensRevisionUriAuthority<RevisionUriData>(uri.authority);
-			this.repoPath = metadata.repoPath;
-
-			let ref = metadata.ref;
-			if (commitOrRepoPath != null && typeof commitOrRepoPath !== 'string') {
-				ref = commitOrRepoPath.sha;
-			}
-
-			if (GitRevision.isUncommittedStaged(ref) || !GitRevision.isUncommitted(ref)) {
-				this.sha = ref;
-			}
-
+			const data = GitUri.parseGitLensRevisionUri(uri, commitOrRepoPath);
+			super(data.components);
+			this.repoPath = data.repoPath;
+			this.sha = data.sha;
+			this.submoduleSha = data.submoduleSha;
 			return;
 		}
 
-		if (uri.scheme === Schemes.Virtual || uri.scheme === Schemes.GitHub) {
+		if (isVirtualUri(uri)) {
+			const data = GitUri.parseVirtualUri(uri, commitOrRepoPath);
 			super(uri);
-
-			const [, owner, repo] = uri.path.split('/', 3);
-			this.repoPath = uri.with({ path: `/${owner}/${repo}` }).toString();
-
-			const data = decodeRemoteHubAuthority<GitHubAuthorityMetadata>(uri);
-
-			let ref = data.metadata?.ref?.id;
-			if (commitOrRepoPath != null && typeof commitOrRepoPath !== 'string') {
-				ref = commitOrRepoPath.sha;
-			}
-
-			if (ref && (GitRevision.isUncommittedStaged(ref) || !GitRevision.isUncommitted(ref))) {
-				this.sha = ref;
-			}
-
+			this.repoPath = data.repoPath;
+			this.sha = data.sha;
 			return;
 		}
 
 		if (commitOrRepoPath === undefined) {
 			super(uri);
-
 			return;
 		}
 
 		if (typeof commitOrRepoPath === 'string') {
 			super(uri);
-
 			this.repoPath = commitOrRepoPath;
-
 			return;
 		}
 
+		const data = GitUri.resolveCommitish(uri, commitOrRepoPath);
+		super(data.components);
+		this.repoPath = data.repoPath;
+		this.sha = data.sha;
+	}
+
+	private static parseGitLensRevisionUri(
+		uri: Uri,
+		commitOrRepoPath: GitCommitish | string | undefined,
+	): { components: Partial<UriComponents>; repoPath: string; sha: string | undefined; submoduleSha?: string } {
+		const metadata = decodeGitLensRevisionUriAuthority<RevisionUriData>(uri.authority);
+
+		let path = uri.path;
+		if (metadata.uncPath != null && !path.startsWith(metadata.uncPath)) {
+			path = `${metadata.uncPath}${uri.path}`;
+		}
+
+		let ref = metadata.ref;
+		if (commitOrRepoPath != null && typeof commitOrRepoPath !== 'string') {
+			ref = commitOrRepoPath.sha;
+		}
+
+		return {
+			components: {
+				scheme: uri.scheme,
+				authority: uri.authority,
+				path: path,
+				query: uri.query,
+				fragment: uri.fragment,
+			},
+			repoPath: metadata.repoPath,
+			sha: !isUncommitted(ref) || isUncommittedStaged(ref) ? ref : undefined,
+			submoduleSha: metadata.submoduleSha,
+		};
+	}
+
+	private static parseVirtualUri(
+		uri: Uri,
+		commitOrRepoPath: GitCommitish | string | undefined,
+	): { repoPath: string; sha: string | undefined } {
+		const [, owner, repo] = uri.path.split('/', 3);
+		const repoPath = uri.with({ path: `/${owner}/${repo}` }).toString();
+
+		const data = decodeRemoteHubAuthority<GitHubAuthorityMetadata>(uri.authority);
+
+		let ref = data.metadata?.ref?.id;
+		if (commitOrRepoPath != null && typeof commitOrRepoPath !== 'string') {
+			ref = commitOrRepoPath.sha;
+		}
+
+		return {
+			repoPath: repoPath,
+			sha: ref && (!isUncommitted(ref) || isUncommittedStaged(ref)) ? ref : undefined,
+		};
+	}
+
+	private static resolveCommitish(
+		uri: Uri,
+		commitish: GitCommitish,
+	): { components: Partial<UriComponents>; repoPath: string; sha: string | undefined } {
 		let authority = uri.authority;
 		let fsPath = normalizePath(
-			Container.instance.git.getAbsoluteUri(commitOrRepoPath.fileName ?? uri.fsPath, commitOrRepoPath.repoPath)
-				.fsPath,
+			Container.instance.git.getAbsoluteUri(commitish.fileName ?? uri.fsPath, commitish.repoPath).fsPath,
 		);
 
 		// Check for authority as used in UNC shares or use the path as given
@@ -153,17 +188,17 @@ export class GitUri extends (Uri as any as UriEx) {
 				break;
 		}
 
-		super({
-			scheme: uri.scheme,
-			authority: authority,
-			path: path,
-			query: uri.query,
-			fragment: uri.fragment,
-		});
-		this.repoPath = commitOrRepoPath.repoPath;
-		if (GitRevision.isUncommittedStaged(commitOrRepoPath.sha) || !GitRevision.isUncommitted(commitOrRepoPath.sha)) {
-			this.sha = commitOrRepoPath.sha;
-		}
+		return {
+			components: {
+				scheme: uri.scheme,
+				authority: authority,
+				path: path,
+				query: uri.query,
+				fragment: uri.fragment,
+			},
+			repoPath: commitish.repoPath,
+			sha: !isUncommitted(commitish.sha) || isUncommittedStaged(commitish.sha) ? commitish.sha : undefined,
+		};
 	}
 
 	@memoize()
@@ -178,12 +213,12 @@ export class GitUri extends (Uri as any as UriEx) {
 
 	@memoize()
 	get isUncommitted(): boolean {
-		return GitRevision.isUncommitted(this.sha);
+		return isUncommitted(this.sha);
 	}
 
 	@memoize()
 	get isUncommittedStaged(): boolean {
-		return GitRevision.isUncommittedStaged(this.sha);
+		return isUncommittedStaged(this.sha);
 	}
 
 	@memoize()
@@ -193,12 +228,16 @@ export class GitUri extends (Uri as any as UriEx) {
 
 	@memoize()
 	get shortSha(): string {
-		return GitRevision.shorten(this.sha);
+		return shortenRevision(this.sha);
 	}
 
+	/**
+	 * Returns a plain (non-GitUri) `Uri` for this document as VS Code sees it.
+	 * For revision files this preserves the gitlens: scheme; for working copies it preserves file:.
+	 * Use {@link workingFileUri} when you need the underlying working-copy file:// URI.
+	 */
 	@memoize()
-	documentUri() {
-		// TODO@eamodio which is correct?
+	get documentUri(): Uri {
 		return Uri.from({
 			scheme: this.scheme,
 			authority: this.authority,
@@ -206,21 +245,21 @@ export class GitUri extends (Uri as any as UriEx) {
 			query: this.query,
 			fragment: this.fragment,
 		});
-		return Container.instance.git.getAbsoluteUri(this.fsPath, this.repoPath);
 	}
 
-	equals(uri: Uri | undefined) {
-		if (!UriComparer.equals(this, uri)) return false;
+	equals(uri: Uri | undefined): boolean {
+		if (!areUrisEqual(this, uri)) return false;
 
-		return this.sha === (GitUri.is(uri) ? uri.sha : undefined);
+		return this.sha === (isGitUri(uri) ? uri.sha : undefined);
 	}
 
 	getFormattedFileName(options?: { suffix?: string; truncateTo?: number }): string {
 		return formatPath(this.fsPath, { ...options, fileOnly: true });
 	}
 
+	/** Returns the file:// URI of this file in the working tree, resolving from `fsPath` and `repoPath`. */
 	@memoize()
-	toFileUri() {
+	get workingFileUri(): Uri {
 		return Container.instance.git.getAbsoluteUri(this.fsPath, this.repoPath);
 	}
 
@@ -229,46 +268,56 @@ export class GitUri extends (Uri as any as UriEx) {
 			typeof file === 'string' ? file : (original && file.originalPath) || file.path,
 			repoPath,
 		);
-		return !ref ? new GitUri(uri, repoPath) : new GitUri(uri, { repoPath: repoPath, sha: ref });
+
+		return !ref
+			? new GitUri(uri, repoPath)
+			: new GitUri(uri, {
+					repoPath: repoPath,
+					// If the file is `?` (untracked), then this must be a stash, so get the ^3 commit to access the untracked file
+					sha: typeof file !== 'string' && file.status === '?' ? `${ref}^3` : ref,
+				});
 	}
 
-	static fromRepoPath(repoPath: string, ref?: string) {
+	static fromRepoPath(repoPath: string, ref?: string): GitUri {
 		return !ref
 			? new GitUri(Container.instance.git.getAbsoluteUri(repoPath, repoPath), repoPath)
 			: new GitUri(Container.instance.git.getAbsoluteUri(repoPath, repoPath), { repoPath: repoPath, sha: ref });
 	}
 
-	static fromRevisionUri(uri: Uri): GitUri {
-		return new GitUri(uri);
-	}
-
-	@debug({
-		exit: uri => `returned ${Logger.toLoggable(uri)}`,
-	})
+	@trace({ exit: true })
 	static async fromUri(uri: Uri): Promise<GitUri> {
-		if (GitUri.is(uri)) return uri;
+		if (isGitUri(uri)) return uri;
+
+		// Check for symbolic links
+		if (uri.scheme === Schemes.File && configuration.get('advanced.resolveSymlinks')) {
+			try {
+				const realPath = await realpath(uri.fsPath);
+				if (!arePathsEqual(uri.fsPath, realPath)) {
+					uri = Uri.file(realPath);
+				}
+			} catch {
+				// Ignore errors (e.g., if path doesn't exist)
+			}
+		}
+
 		if (!Container.instance.git.isTrackable(uri)) return new GitUri(uri);
 		if (uri.scheme === Schemes.GitLens) return new GitUri(uri);
 
 		// If this is a git uri, find its repoPath
 		if (uri.scheme === Schemes.Git) {
-			let data: { path: string; ref: string } | undefined;
-			try {
-				data = JSON.parse(uri.query);
-			} catch {}
-
+			const data = getQueryDataFromScmGitUri(uri);
 			if (data?.path) {
 				const repository = await Container.instance.git.getOrOpenRepository(Uri.file(data.path));
 				if (repository == null) {
 					debugger;
-					throw new Error(`Unable to find repository for uri=${uri.toString(false)}`);
+					throw new Error(`Unable to find repository for uri=${Uri.file(data.path).toString(true)}`);
 				}
 
 				let ref;
 				switch (data.ref) {
 					case '':
 					case '~':
-						ref = GitRevision.uncommittedStaged;
+						ref = uncommittedStaged;
 						break;
 
 					case null:
@@ -282,7 +331,7 @@ export class GitUri extends (Uri as any as UriEx) {
 
 				const commitish: GitCommitish = {
 					fileName: data.path,
-					repoPath: repository?.path,
+					repoPath: repository.path,
 					sha: ref,
 				};
 				return new GitUri(uri, commitish);
@@ -306,26 +355,15 @@ export class GitUri extends (Uri as any as UriEx) {
 			} catch {}
 
 			if (data?.fileName) {
-				const repository = await Container.instance.git.getOrOpenRepository(Uri.file(data.fileName));
+				const repository = await Container.instance.git.getOrOpenRepository(uri);
 				if (repository == null) {
 					debugger;
-					throw new Error(`Unable to find repository for uri=${uri.toString(false)}`);
-				}
-
-				let repoPath = normalizePath(uri.fsPath);
-				if (repoPath.endsWith(data.fileName)) {
-					repoPath = repoPath.substr(0, repoPath.length - data.fileName.length - 1);
-				} else {
-					// eslint-disable-next-line @typescript-eslint/no-non-null-asserted-optional-chain
-					repoPath = (await Container.instance.git.getOrOpenRepository(uri))?.path!;
-					if (!repoPath) {
-						debugger;
-					}
+					throw new Error(`Unable to find repository for uri=${Uri.file(data.fileName).toString(true)}`);
 				}
 
 				const commitish: GitCommitish = {
 					fileName: data.fileName,
-					repoPath: repoPath,
+					repoPath: repository.path,
 					sha: data.isBase ? data.baseCommit : data.headCommit,
 				};
 				return new GitUri(uri, commitish);
@@ -337,24 +375,8 @@ export class GitUri extends (Uri as any as UriEx) {
 	}
 }
 
-export function decodeGitLensRevisionUriAuthority<T>(authority: string): T {
-	return JSON.parse(decodeUtf8Hex(authority)) as T;
-}
+export const unknownGitUri = Object.freeze(new GitUri());
 
-export function encodeGitLensRevisionUriAuthority<T>(metadata: T): string {
-	return encodeUtf8Hex(JSON.stringify(metadata));
-}
-
-function decodeRemoteHubAuthority<T>(uri: Uri): { scheme: string; metadata: T | undefined } {
-	const [scheme, encoded] = uri.authority.split('+');
-
-	let metadata: T | undefined;
-	if (encoded) {
-		try {
-			const data = JSON.parse(decodeUtf8Hex(encoded));
-			metadata = data as T;
-		} catch {}
-	}
-
-	return { scheme: scheme, metadata: metadata };
+export function isGitUri(uri: unknown): uri is GitUri {
+	return uri instanceof GitUri;
 }

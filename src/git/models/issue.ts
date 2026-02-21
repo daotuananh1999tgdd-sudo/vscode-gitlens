@@ -1,57 +1,87 @@
-import { ColorThemeKind, ThemeColor, ThemeIcon, window } from 'vscode';
-import { Colors } from '../../constants';
-import { RemoteProviderReference } from './remoteProvider';
+import { loggable } from '../../system/decorators/log.js';
+import type { IssueOrPullRequest, IssueOrPullRequestState } from './issueOrPullRequest.js';
+import type { ProviderReference } from './remoteProvider.js';
+import type { RepositoryIdentityDescriptor } from './repositoryIdentities.js';
 
-export const enum IssueOrPullRequestType {
-	Issue = 'Issue',
-	PullRequest = 'PullRequest',
+export function isIssue(issue: unknown): issue is Issue {
+	return issue instanceof Issue;
 }
 
-export interface IssueOrPullRequest {
-	type: IssueOrPullRequestType;
-	provider: RemoteProviderReference;
+export interface IssueShape extends IssueOrPullRequest {
+	author: IssueMember;
+	assignees: IssueMember[];
+	repository?: IssueRepository;
+	labels?: IssueLabel[];
+	body?: string;
+	project?: IssueProject;
+}
+
+@loggable(i => i.id)
+export class Issue implements IssueShape {
+	readonly type = 'issue';
+
+	constructor(
+		public readonly provider: ProviderReference,
+		public readonly id: string,
+		public readonly nodeId: string | undefined,
+		public readonly title: string,
+		public readonly url: string,
+		public readonly createdDate: Date,
+		public readonly updatedDate: Date,
+		public readonly closed: boolean,
+		public readonly state: IssueOrPullRequestState,
+		public readonly author: IssueMember,
+		public readonly assignees: IssueMember[],
+		public readonly repository?: IssueRepository,
+		public readonly closedDate?: Date,
+		public readonly labels?: IssueLabel[],
+		public readonly commentsCount?: number,
+		public readonly thumbsUpCount?: number,
+		public readonly body?: string,
+		public readonly project?: IssueProject,
+		public readonly number?: string,
+	) {}
+}
+
+export const enum RepositoryAccessLevel {
+	Admin = 100,
+	Maintain = 40,
+	Write = 30,
+	Triage = 20,
+	Read = 10,
+	None = 0,
+}
+
+export interface IssueLabel {
+	color?: string;
+	name: string;
+}
+
+export interface IssueMember {
 	id: string;
-	date: Date;
-	title: string;
-	closed: boolean;
-	closedDate?: Date;
-	url: string;
+	name: string;
+	avatarUrl?: string;
+	url?: string;
 }
 
-export namespace IssueOrPullRequest {
-	export function getMarkdownIcon(issue: IssueOrPullRequest): string {
-		if (issue.type === IssueOrPullRequestType.PullRequest) {
-			if (issue.closed) {
-				return `<span style="color:${
-					window.activeColorTheme.kind === ColorThemeKind.Dark ? '#a371f7' : '#8250df'
-				};">$(git-pull-request)</span>`;
-			}
-			return `<span style="color:${
-				window.activeColorTheme.kind === ColorThemeKind.Dark ? '#3fb950' : '#1a7f37'
-			};">$(git-pull-request)</span>`;
-		}
-
-		if (issue.closed) {
-			return `<span style="color:${
-				window.activeColorTheme.kind === ColorThemeKind.Dark ? '#a371f7' : '#8250df'
-			};">$(pass)</span>`;
-		}
-		return `<span style="color:${
-			window.activeColorTheme.kind === ColorThemeKind.Dark ? '#3fb950' : '#1a7f37'
-		};">$(issue)</span>`;
-	}
-
-	export function getThemeIcon(issue: IssueOrPullRequest): ThemeIcon {
-		if (issue.type === IssueOrPullRequestType.PullRequest) {
-			if (issue.closed) {
-				return new ThemeIcon('git-pull-request', new ThemeColor(Colors.MergedPullRequestIconColor));
-			}
-			return new ThemeIcon('git-pull-request', new ThemeColor(Colors.OpenPullRequestIconColor));
-		}
-
-		if (issue.closed) {
-			return new ThemeIcon('pass', new ThemeColor(Colors.ClosedAutolinkedIssueIconColor));
-		}
-		return new ThemeIcon('issues', new ThemeColor(Colors.OpenAutolinkedIssueIconColor));
-	}
+export interface IssueProject {
+	id: string;
+	name: string;
+	resourceId: string;
+	resourceName: string;
 }
+
+export interface IssueRepository {
+	owner: string;
+	repo: string;
+	accessLevel?: RepositoryAccessLevel;
+	url?: string;
+	id?: string;
+}
+
+export type IssueRepositoryIdentityDescriptor = RequireSomeWithProps<
+	RequireSome<RepositoryIdentityDescriptor<string>, 'provider'>,
+	'provider',
+	'id' | 'domain' | 'repoDomain' | 'repoName'
+> &
+	RequireSomeWithProps<RequireSome<RepositoryIdentityDescriptor<string>, 'remote'>, 'remote', 'domain'>;

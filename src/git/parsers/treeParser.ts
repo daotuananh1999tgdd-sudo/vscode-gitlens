@@ -1,39 +1,61 @@
-import { debug } from '../../system/decorators/log';
-import { GitTreeEntry } from '../models';
+import { maybeStopWatch } from '../../system/stopwatch.js';
+import { iterateByDelimiter } from '../../system/string.js';
+import type { GitTreeEntry, GitTreeType } from '../models/tree.js';
 
-const emptyStr = '';
-const treeRegex = /(?:.+?)\s+(.+?)\s+(.+?)\s+(.+?)\s+(.+)/gm;
+export function parseGitTree(data: string | undefined, ref: string, singleEntry: boolean): GitTreeEntry[] {
+	using sw = maybeStopWatch(`Git.parseTree`, { log: { onlyExit: true, level: 'debug' } });
 
-export class GitTreeParser {
-	@debug({ args: false, singleLine: true })
-	static parse(data: string | undefined): GitTreeEntry[] | undefined {
-		if (!data) return undefined;
-
-		const trees: GitTreeEntry[] = [];
-
-		let type;
-		let sha;
-		let size;
-		let filePath;
-
-		let match;
-		do {
-			match = treeRegex.exec(data);
-			if (match == null) break;
-
-			[, type, sha, size, filePath] = match;
-
-			trees.push({
-				// Stops excessive memory usage -- https://bugs.chromium.org/p/v8/issues/detail?id=2869
-				commitSha: sha == null || sha.length === 0 ? emptyStr : ` ${sha}`.substr(1),
-				// Stops excessive memory usage -- https://bugs.chromium.org/p/v8/issues/detail?id=2869
-				path: filePath == null || filePath.length === 0 ? emptyStr : ` ${filePath}`.substr(1),
-				size: Number(size) || 0,
-				// Stops excessive memory usage -- https://bugs.chromium.org/p/v8/issues/detail?id=2869
-				type: (type == null || type.length === 0 ? emptyStr : ` ${type}`.substr(1)) as 'blob' | 'tree',
-			});
-		} while (true);
-
+	const trees: GitTreeEntry[] = [];
+	if (!data) {
+		sw?.stop({ suffix: ` no data` });
 		return trees;
 	}
+
+	// Format: <mode> <type> <oid> <size>\t<path>
+
+	let metadata: string;
+	let oid: string;
+	let size: number;
+	let type: GitTreeType;
+	let path: string;
+
+	let startIndex = 0;
+	let endIndex = 0;
+
+	// Avoid generator if we are only parsing a single entry
+	for (let line of singleEntry ? data.split('\n') : iterateByDelimiter(data, '\n')) {
+		line = line.trim();
+		if (!line) continue;
+
+		[metadata, path] = line.split('\t');
+
+		// Skip mode
+		startIndex = metadata.indexOf(' ');
+		if (startIndex === -1) continue;
+
+		// Parse type
+		startIndex++;
+		endIndex = metadata.indexOf(' ', startIndex);
+		if (endIndex === -1) continue;
+
+		type = metadata.substring(startIndex, endIndex) as GitTreeType;
+
+		// Parse oid
+		startIndex = endIndex + 1;
+		endIndex = metadata.indexOf(' ', startIndex);
+		if (endIndex === -1) continue;
+
+		oid = metadata.substring(startIndex, endIndex);
+
+		// Parse size
+		startIndex = endIndex + 1;
+
+		size = parseInt(metadata.substring(startIndex), 10);
+
+		trees.push({ ref: ref, oid: oid, path: path || '', size: isNaN(size) ? 0 : size, type: type || 'blob' });
+	}
+
+	sw?.stop({ suffix: ` parsed ${trees.length} trees` });
+
+	return trees;
 }

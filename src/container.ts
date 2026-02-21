@@ -1,83 +1,118 @@
+import type { ConfigurationChangeEvent, Disposable, Event, ExtensionContext } from 'vscode';
+import { EventEmitter, ExtensionMode } from 'vscode';
 import {
-	ConfigurationChangeEvent,
-	ConfigurationScope,
-	Event,
-	EventEmitter,
-	ExtensionContext,
-	ExtensionMode,
-} from 'vscode';
-import { getSupportedGitProviders } from '@env/providers';
-import { Autolinks } from './annotations/autolinks';
-import { FileAnnotationController } from './annotations/fileAnnotationController';
-import { LineAnnotationController } from './annotations/lineAnnotationController';
-import { ActionRunners } from './api/actionRunners';
-import { resetAvatarCache } from './avatars';
-import { GitCodeLensController } from './codelens/codeLensController';
-import type { ToggleFileAnnotationCommandArgs } from './commands';
+	getGkCliIntegrationProvider,
+	getMcpProviders,
+	getSharedGKStorageLocationProvider,
+	getSupportedGitProviders,
+	getSupportedRepositoryLocationProvider,
+	getSupportedWorkspacesStorageProvider,
+	setTelemetryService,
+} from '@env/providers.js';
+import { FileAnnotationController } from './annotations/fileAnnotationController.js';
+import { LineAnnotationController } from './annotations/lineAnnotationController.js';
+import { ActionRunners } from './api/actionRunners.js';
+import { AutolinksProvider } from './autolinks/autolinksProvider.js';
+import { setDefaultGravatarsStyle } from './avatars.js';
+import { CacheProvider } from './cache.js';
+import { GitCodeLensController } from './codelens/codeLensController.js';
+import type { ToggleFileAnnotationCommandArgs } from './commands/toggleFileAnnotations.js';
+import type { DateSource, DateStyle, FileAnnotationType, Mode } from './config.js';
+import type { GlCommands } from './constants.commands.js';
+import { extensionPrefix } from './constants.js';
+import { MarkdownContentProvider } from './documents/markdown.js';
+import { EventBus } from './eventBus.js';
+import { GitFileSystemProvider } from './git/fsProvider.js';
+import { GitProviderService } from './git/gitProviderService.js';
+import type { RepositoryLocationProvider } from './git/location/repositorylocationProvider.js';
+import { LineHoverController } from './hovers/lineHoverController.js';
+import { AIProviderService } from './plus/ai/aiProviderService.js';
+import { DraftService } from './plus/drafts/draftsService.js';
+import { AccountAuthenticationProvider } from './plus/gk/authenticationProvider.js';
+import { OrganizationService } from './plus/gk/organizationService.js';
+import { ProductConfigProvider } from './plus/gk/productConfigProvider.js';
+import { ServerConnection } from './plus/gk/serverConnection.js';
+import { SubscriptionService } from './plus/gk/subscriptionService.js';
+import { UrlsProvider } from './plus/gk/urlsProvider.js';
+import { GraphStatusBarController } from './plus/graph/statusbar.js';
+import type { CloudIntegrationService } from './plus/integrations/authentication/cloudIntegrationService.js';
+import { ConfiguredIntegrationService } from './plus/integrations/authentication/configuredIntegrationService.js';
+import { IntegrationAuthenticationService } from './plus/integrations/authentication/integrationAuthenticationService.js';
+import { IntegrationService } from './plus/integrations/integrationService.js';
+import type { AzureDevOpsApi } from './plus/integrations/providers/azure/azure.js';
+import type { BitbucketApi } from './plus/integrations/providers/bitbucket/bitbucket.js';
+import type { GitHubApi } from './plus/integrations/providers/github/github.js';
+import type { GitLabApi } from './plus/integrations/providers/gitlab/gitlab.js';
+import { EnrichmentService } from './plus/launchpad/enrichmentService.js';
+import { LaunchpadIndicator } from './plus/launchpad/launchpadIndicator.js';
+import { LaunchpadProvider } from './plus/launchpad/launchpadProvider.js';
+import { RepositoryIdentityService } from './plus/repos/repositoryIdentityService.js';
+import type { SharedGkStorageLocationProvider } from './plus/repos/sharedGkStorageLocationProvider.js';
+import { WorkspacesApi } from './plus/workspaces/workspacesApi.js';
+import { scheduleAddMissingCurrentWorkspaceRepos, WorkspacesService } from './plus/workspaces/workspacesService.js';
+import { StatusBarController } from './statusbar/statusBarController.js';
+import { executeCommand } from './system/-webview/command.js';
+import { configuration } from './system/-webview/configuration.js';
+import { Keyboard } from './system/-webview/keyboard.js';
+import type { Storage } from './system/-webview/storage.js';
+import { debug } from './system/decorators/log.js';
+import { memoize } from './system/decorators/memoize.js';
+import { Logger } from './system/logger.js';
+import { AIFeedbackProvider } from './telemetry/aiFeedbackProvider.js';
+import { TelemetryService } from './telemetry/telemetry.js';
+import { UsageTracker } from './telemetry/usageTracker.js';
+import { WalkthroughStateProvider } from './telemetry/walkthroughStateProvider.js';
+import { GitTerminalLinkProvider } from './terminal/linkProvider.js';
+import { GitDocumentTracker } from './trackers/documentTracker.js';
+import { LineTracker } from './trackers/lineTracker.js';
+import { DeepLinkService } from './uris/deepLinks/deepLinkService.js';
+import { UriService } from './uris/uriService.js';
+import { ViewFileDecorationProvider } from './views/viewDecorationProvider.js';
+import { Views } from './views/views.js';
+import { VslsController } from './vsls/vsls.js';
 import {
-	AnnotationsToggleMode,
-	Config,
-	configuration,
-	ConfigurationWillChangeEvent,
-	DateSource,
-	DateStyle,
-	FileAnnotationType,
-} from './configuration';
-import { Commands } from './constants';
-import { GitFileSystemProvider } from './git/fsProvider';
-import { GitProviderService } from './git/gitProviderService';
-import { LineHoverController } from './hovers/lineHoverController';
-import { Keyboard } from './keyboard';
-import { Logger } from './logger';
-import { SubscriptionService } from './premium/subscription/subscriptionService';
-import { TimelineWebview } from './premium/webviews/timeline/timelineWebview';
-import { TimelineWebviewView } from './premium/webviews/timeline/timelineWebviewView';
-import { StatusBarController } from './statusbar/statusBarController';
-import { Storage } from './storage';
-import { executeCommand } from './system/command';
-import { log } from './system/decorators/log';
-import { memoize } from './system/decorators/memoize';
-import { GitTerminalLinkProvider } from './terminal/linkProvider';
-import { GitDocumentTracker } from './trackers/gitDocumentTracker';
-import { GitLineTracker } from './trackers/gitLineTracker';
-import { BranchesView } from './views/branchesView';
-import { CommitsView } from './views/commitsView';
-import { ContributorsView } from './views/contributorsView';
-import { FileHistoryView } from './views/fileHistoryView';
-import { LineHistoryView } from './views/lineHistoryView';
-import { RemotesView } from './views/remotesView';
-import { RepositoriesView } from './views/repositoriesView';
-import { SearchAndCompareView } from './views/searchAndCompareView';
-import { StashesView } from './views/stashesView';
-import { TagsView } from './views/tagsView';
-import { ViewCommands } from './views/viewCommands';
-import { ViewFileDecorationProvider } from './views/viewDecorationProvider';
-import { WorktreesView } from './views/worktreesView';
-import { VslsController } from './vsls/vsls';
-import { HomeWebviewView } from './webviews/home/homeWebviewView';
-import { RebaseEditorProvider } from './webviews/rebase/rebaseEditor';
-import { SettingsWebview } from './webviews/settings/settingsWebview';
-import { WelcomeWebview } from './webviews/welcome/welcomeWebview';
+	registerComposerWebviewCommands,
+	registerComposerWebviewPanel,
+} from './webviews/plus/composer/registration.js';
+import { registerGraphWebviewCommands, registerGraphWebviewPanel } from './webviews/plus/graph/registration.js';
+import { registerPatchDetailsWebviewPanel } from './webviews/plus/patchDetails/registration.js';
+import {
+	registerTimelineWebviewCommands,
+	registerTimelineWebviewPanel,
+} from './webviews/plus/timeline/registration.js';
+import { RebaseEditorProvider } from './webviews/rebase/rebaseEditor.js';
+import { registerSettingsWebviewCommands, registerSettingsWebviewPanel } from './webviews/settings/registration.js';
+import { WebviewCommandRegistrar } from './webviews/webviewCommandRegistrar.js';
+import { WebviewsController } from './webviews/webviewsController.js';
+
+export type Environment = 'dev' | 'staging' | 'production';
 
 export class Container {
 	static #instance: Container | undefined;
 	static #proxy = new Proxy<Container>({} as Container, {
-		get: function (target, prop) {
+		get: function (_target, prop) {
 			// In case anyone has cached this instance
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-return
 			if (Container.#instance != null) return (Container.#instance as any)[prop];
 
 			// Allow access to config before we are initialized
-			if (prop === 'config') return configuration.get();
+			if (prop === 'config') return configuration.getAll();
 
 			// debugger;
 			throw new Error('Container is not initialized');
 		},
 	});
 
-	static create(context: ExtensionContext, cfg: Config) {
+	static create(
+		context: ExtensionContext,
+		storage: Storage,
+		prerelease: boolean,
+		version: string,
+		previousVersion: string | undefined,
+	): Container {
 		if (Container.#instance != null) throw new Error('Container is already initialized');
 
-		Container.#instance = new Container(context, cfg);
+		Container.#instance = new Container(context, storage, prerelease, version, previousVersion);
 		return Container.#instance;
 	}
 
@@ -87,14 +122,24 @@ export class Container {
 
 	private _onReady: EventEmitter<void> = new EventEmitter<void>();
 	get onReady(): Event<void> {
+		if (this._ready) {
+			const emitter = new EventEmitter<void>();
+			setTimeout(() => emitter.fire(), 0);
+			return emitter.event;
+		}
+
 		return this._onReady.event;
+	}
+
+	toLoggable(): string {
+		return '<container>';
 	}
 
 	readonly BranchDateFormatting = {
 		dateFormat: undefined! as string | null,
 		dateStyle: undefined! as DateStyle,
 
-		reset: () => {
+		reset: (): void => {
 			this.BranchDateFormatting.dateFormat = configuration.get('defaultDateFormat');
 			this.BranchDateFormatting.dateStyle = configuration.get('defaultDateStyle');
 		},
@@ -102,10 +147,10 @@ export class Container {
 
 	readonly CommitDateFormatting = {
 		dateFormat: null as string | null,
-		dateSource: DateSource.Authored,
-		dateStyle: DateStyle.Relative,
+		dateSource: 'authored' as DateSource,
+		dateStyle: 'relative' as DateStyle,
 
-		reset: () => {
+		reset: (): void => {
 			this.CommitDateFormatting.dateFormat = configuration.get('defaultDateFormat');
 			this.CommitDateFormatting.dateSource = configuration.get('defaultDateSource');
 			this.CommitDateFormatting.dateStyle = configuration.get('defaultDateStyle');
@@ -115,7 +160,7 @@ export class Container {
 	readonly CommitShaFormatting = {
 		length: 7,
 
-		reset: () => {
+		reset: (): void => {
 			// Don't allow shas to be shortened to less than 5 characters
 			this.CommitShaFormatting.length = Math.max(5, configuration.get('advanced.abbreviatedShaLength'));
 		},
@@ -123,9 +168,9 @@ export class Container {
 
 	readonly PullRequestDateFormatting = {
 		dateFormat: null as string | null,
-		dateStyle: DateStyle.Relative,
+		dateStyle: 'relative',
 
-		reset: () => {
+		reset: (): void => {
 			this.PullRequestDateFormatting.dateFormat = configuration.get('defaultDateFormat');
 			this.PullRequestDateFormatting.dateStyle = configuration.get('defaultDateStyle');
 		},
@@ -133,193 +178,313 @@ export class Container {
 
 	readonly TagDateFormatting = {
 		dateFormat: null as string | null,
-		dateStyle: DateStyle.Relative,
+		dateStyle: 'relative',
 
-		reset: () => {
+		reset: (): void => {
 			this.TagDateFormatting.dateFormat = configuration.get('defaultDateFormat');
 			this.TagDateFormatting.dateStyle = configuration.get('defaultDateStyle');
 		},
 	};
 
-	private _configsAffectedByMode: string[] | undefined;
-	private _applyModeConfigurationTransformBound:
-		| ((e: ConfigurationChangeEvent) => ConfigurationChangeEvent)
-		| undefined;
-
+	private readonly _connection: ServerConnection;
+	private _disposables: Disposable[];
 	private _terminalLinks: GitTerminalLinkProvider | undefined;
+	private _launchpadIndicator: LaunchpadIndicator | undefined;
 
-	private constructor(context: ExtensionContext, config: Config) {
+	private constructor(
+		context: ExtensionContext,
+		storage: Storage,
+		prerelease: boolean,
+		version: string,
+		previousVersion: string | undefined,
+	) {
 		this._context = context;
-		this._config = this.applyMode(config);
-		this._storage = new Storage(this._context);
+		this._prerelease = prerelease;
+		this._version = version;
+		this._previousVersion = previousVersion;
+		this.ensureModeApplied();
 
-		context.subscriptions.push(configuration.onWillChange(this.onConfigurationChanging, this));
+		this._disposables = [
+			configuration,
+			(this._storage = storage),
+			(this._telemetry = new TelemetryService(this)),
+			(this._usage = new UsageTracker(this, storage)),
+			configuration.onDidChangeAny(this.onAnyConfigurationChanged, this),
+		];
+		setTelemetryService(this._telemetry);
 
-		context.subscriptions.push((this._subscription = new SubscriptionService(this)));
+		this._urls = new UrlsProvider(this.env);
+		this._disposables.push((this._connection = new ServerConnection(this, this._urls)));
 
-		context.subscriptions.push((this._git = new GitProviderService(this)));
-		context.subscriptions.push(new GitFileSystemProvider(this));
+		this._disposables.push(
+			(this._accountAuthentication = new AccountAuthenticationProvider(this, this._connection)),
+		);
+		this._disposables.push((this._uri = new UriService(this)));
+		this._disposables.push((this._subscription = new SubscriptionService(this, this._connection, previousVersion)));
+		this._disposables.push((this._walkthrough = new WalkthroughStateProvider(this)));
+		this._disposables.push((this._organizations = new OrganizationService(this, this._connection)));
 
-		context.subscriptions.push((this._actionRunners = new ActionRunners(this)));
-		context.subscriptions.push((this._tracker = new GitDocumentTracker(this)));
-		context.subscriptions.push((this._lineTracker = new GitLineTracker(this)));
-		context.subscriptions.push((this._keyboard = new Keyboard()));
-		context.subscriptions.push((this._vsls = new VslsController(this)));
+		this._disposables.push((this._git = new GitProviderService(this)));
+		this._disposables.push(new GitFileSystemProvider(this));
 
-		context.subscriptions.push((this._fileAnnotationController = new FileAnnotationController(this)));
-		context.subscriptions.push((this._lineAnnotationController = new LineAnnotationController(this)));
-		context.subscriptions.push((this._lineHoverController = new LineHoverController(this)));
-		context.subscriptions.push((this._statusBarController = new StatusBarController(this)));
-		context.subscriptions.push((this._codeLensController = new GitCodeLensController(this)));
+		this._disposables.push((this._deepLinks = new DeepLinkService(this)));
 
-		context.subscriptions.push((this._settingsWebview = new SettingsWebview(this)));
-		context.subscriptions.push((this._timelineWebview = new TimelineWebview(this)));
-		context.subscriptions.push((this._welcomeWebview = new WelcomeWebview(this)));
-		context.subscriptions.push((this._rebaseEditor = new RebaseEditorProvider(this)));
+		this._disposables.push((this._actionRunners = new ActionRunners(this)));
+		this._disposables.push((this._documentTracker = new GitDocumentTracker(this)));
+		this._disposables.push((this._lineTracker = new LineTracker(this, this._documentTracker)));
+		this._disposables.push((this._keyboard = new Keyboard()));
+		this._disposables.push((this._vsls = new VslsController(this)));
+		this._disposables.push((this._eventBus = new EventBus()));
+		this._disposables.push((this._launchpadProvider = new LaunchpadProvider(this)));
+		this._disposables.push((this._markdownProvider = new MarkdownContentProvider(this)));
 
-		context.subscriptions.push(new ViewFileDecorationProvider());
+		this._disposables.push((this._fileAnnotationController = new FileAnnotationController(this)));
+		this._disposables.push((this._lineAnnotationController = new LineAnnotationController(this)));
+		this._disposables.push((this._lineHoverController = new LineHoverController(this)));
+		this._disposables.push((this._statusBarController = new StatusBarController(this)));
+		this._disposables.push((this._codeLensController = new GitCodeLensController(this)));
 
-		context.subscriptions.push((this._repositoriesView = new RepositoriesView(this)));
-		context.subscriptions.push((this._commitsView = new CommitsView(this)));
-		context.subscriptions.push((this._fileHistoryView = new FileHistoryView(this)));
-		context.subscriptions.push((this._lineHistoryView = new LineHistoryView(this)));
-		context.subscriptions.push((this._branchesView = new BranchesView(this)));
-		context.subscriptions.push((this._remotesView = new RemotesView(this)));
-		context.subscriptions.push((this._stashesView = new StashesView(this)));
-		context.subscriptions.push((this._tagsView = new TagsView(this)));
-		context.subscriptions.push((this._worktreesView = new WorktreesView(this)));
-		context.subscriptions.push((this._contributorsView = new ContributorsView(this)));
-		context.subscriptions.push((this._searchAndCompareView = new SearchAndCompareView(this)));
+		const webviewCommandRegistrar = new WebviewCommandRegistrar();
+		this._disposables.push(webviewCommandRegistrar);
 
-		context.subscriptions.push((this._homeView = new HomeWebviewView(this)));
-		context.subscriptions.push((this._timelineView = new TimelineWebviewView(this)));
+		const webviews = new WebviewsController(this, webviewCommandRegistrar);
+		this._disposables.push(webviews);
+		this._disposables.push((this._views = new Views(this, webviews)));
 
-		if (config.terminalLinks.enabled) {
-			context.subscriptions.push((this._terminalLinks = new GitTerminalLinkProvider(this)));
+		const graphPanels = registerGraphWebviewPanel(webviews);
+		this._disposables.push(graphPanels);
+		this._disposables.push(registerGraphWebviewCommands(this, graphPanels));
+		this._disposables.push(new GraphStatusBarController(this));
+
+		const composerPanels = registerComposerWebviewPanel(webviews);
+		this._disposables.push(composerPanels);
+		this._disposables.push(registerComposerWebviewCommands(this, composerPanels));
+
+		const timelinePanels = registerTimelineWebviewPanel(webviews);
+		this._disposables.push(timelinePanels);
+		this._disposables.push(registerTimelineWebviewCommands(this, timelinePanels));
+
+		this._disposables.push((this._rebaseEditor = new RebaseEditorProvider(this, webviewCommandRegistrar)));
+
+		const settingsPanels = registerSettingsWebviewPanel(webviews);
+		this._disposables.push(settingsPanels);
+		this._disposables.push(registerSettingsWebviewCommands(settingsPanels));
+
+		this._disposables.push(new ViewFileDecorationProvider());
+
+		const patchDetailsPanels = registerPatchDetailsWebviewPanel(webviews);
+		this._disposables.push(patchDetailsPanels);
+
+		if (configuration.get('launchpad.indicator.enabled')) {
+			this._disposables.push((this._launchpadIndicator = new LaunchpadIndicator(this, this._launchpadProvider)));
 		}
 
-		context.subscriptions.push(
-			configuration.onDidChange(e => {
-				if (!configuration.changed(e, 'terminalLinks.enabled')) return;
+		if (configuration.get('terminalLinks.enabled')) {
+			this._disposables.push((this._terminalLinks = new GitTerminalLinkProvider(this)));
+		}
 
-				this._terminalLinks?.dispose();
-				if (this.config.terminalLinks.enabled) {
-					context.subscriptions.push((this._terminalLinks = new GitTerminalLinkProvider(this)));
+		const cliIntegration = getGkCliIntegrationProvider(this);
+		if (cliIntegration != null) {
+			this._disposables.push(cliIntegration);
+		}
+
+		this._disposables.push(
+			configuration.onDidChange(e => {
+				if (configuration.changed(e, 'terminalLinks.enabled')) {
+					this._terminalLinks?.dispose();
+					this._terminalLinks = undefined;
+					if (configuration.get('terminalLinks.enabled')) {
+						this._disposables.push((this._terminalLinks = new GitTerminalLinkProvider(this)));
+					}
+				}
+
+				if (configuration.changed(e, 'launchpad.indicator.enabled')) {
+					this._launchpadIndicator?.dispose();
+					this._launchpadIndicator = undefined;
+
+					this.telemetry.sendEvent('launchpad/indicator/hidden');
+
+					if (configuration.get('launchpad.indicator.enabled')) {
+						this._disposables.push(
+							(this._launchpadIndicator = new LaunchpadIndicator(this, this._launchpadProvider)),
+						);
+					}
 				}
 			}),
 		);
+
+		context.subscriptions.push({
+			dispose: () => this._disposables.reverse().forEach(d => void d?.dispose()),
+		});
+
+		scheduleAddMissingCurrentWorkspaceRepos(this);
+	}
+
+	deactivate(): void {
+		this._deactivating = true;
+	}
+
+	private _deactivating: boolean = false;
+	get deactivating(): boolean {
+		return this._deactivating;
 	}
 
 	private _ready: boolean = false;
 
-	async ready() {
+	async ready(): Promise<void> {
 		if (this._ready) throw new Error('Container is already ready');
 
 		this._ready = true;
 		await this.registerGitProviders();
+		await this.registerMcpProviders();
 		queueMicrotask(() => this._onReady.fire());
 	}
 
-	@log()
-	private async registerGitProviders() {
+	@debug()
+	private async registerGitProviders(): Promise<void> {
 		const providers = await getSupportedGitProviders(this);
 		for (const provider of providers) {
-			this._context.subscriptions.push(this._git.register(provider.descriptor.id, provider));
+			this._disposables.push(this._git.register(provider.descriptor.id, provider));
 		}
 
-		this._git.registrationComplete();
+		// Don't wait here otherwise will we deadlock in certain places
+		void this._git.registrationComplete();
 	}
 
-	private onConfigurationChanging(e: ConfigurationWillChangeEvent) {
-		this._config = undefined;
-
-		if (configuration.changed(e.change, 'outputLevel')) {
-			Logger.logLevel = configuration.get('outputLevel');
-		}
-
-		if (configuration.changed(e.change, 'defaultGravatarsStyle')) {
-			resetAvatarCache('fallback');
-		}
-
-		if (configuration.changed(e.change, 'mode') || configuration.changed(e.change, 'modes')) {
-			if (this._applyModeConfigurationTransformBound == null) {
-				this._applyModeConfigurationTransformBound = this.applyModeConfigurationTransform.bind(this);
-			}
-			e.transform = this._applyModeConfigurationTransformBound;
+	@debug()
+	private async registerMcpProviders(): Promise<void> {
+		const mcpProviders = await getMcpProviders(this);
+		if (mcpProviders != null) {
+			this._disposables.push(...mcpProviders);
 		}
 	}
 
-	private _actionRunners: ActionRunners;
-	get actionRunners() {
-		if (this._actionRunners == null) {
-			this._context.subscriptions.push((this._actionRunners = new ActionRunners(this)));
+	private onAnyConfigurationChanged(e: ConfigurationChangeEvent) {
+		if (!configuration.changedAny(e, extensionPrefix)) return;
+
+		this._mode = undefined;
+
+		if (configuration.changed(e, 'defaultGravatarsStyle')) {
+			setDefaultGravatarsStyle(configuration.get('defaultGravatarsStyle'));
 		}
 
+		if (configuration.changed(e, 'mode')) {
+			this.ensureModeApplied();
+		}
+	}
+
+	private _accountAuthentication: AccountAuthenticationProvider;
+	get accountAuthentication(): AccountAuthenticationProvider {
+		return this._accountAuthentication;
+	}
+
+	private readonly _actionRunners: ActionRunners;
+	get actionRunners(): ActionRunners {
 		return this._actionRunners;
 	}
 
-	private _autolinks: Autolinks | undefined;
-	get autolinks() {
+	private _ai: AIProviderService | undefined;
+	get ai(): AIProviderService {
+		if (this._ai == null) {
+			this._disposables.push((this._ai = new AIProviderService(this, this._connection)));
+		}
+		return this._ai;
+	}
+
+	private _aiFeedback: AIFeedbackProvider | undefined;
+	get aiFeedback(): AIFeedbackProvider {
+		if (this._aiFeedback == null) {
+			this._disposables.push((this._aiFeedback = new AIFeedbackProvider()));
+		}
+		return this._aiFeedback;
+	}
+
+	private _autolinks: AutolinksProvider | undefined;
+	get autolinks(): AutolinksProvider {
 		if (this._autolinks == null) {
-			this._context.subscriptions.push((this._autolinks = new Autolinks(this)));
+			this._disposables.push((this._autolinks = new AutolinksProvider(this)));
 		}
 
 		return this._autolinks;
 	}
 
-	private _codeLensController: GitCodeLensController;
-	get codeLens() {
+	private _cache: CacheProvider | undefined;
+	get cache(): CacheProvider {
+		if (this._cache == null) {
+			this._disposables.push((this._cache = new CacheProvider(this)));
+		}
+
+		return this._cache;
+	}
+
+	private _cloudIntegrations: Promise<CloudIntegrationService | undefined> | undefined;
+	get cloudIntegrations(): Promise<CloudIntegrationService | undefined> {
+		if (this._cloudIntegrations == null) {
+			async function load(this: Container) {
+				try {
+					const cloudIntegrations = new (
+						await import(
+							/* webpackChunkName: "integrations" */ './plus/integrations/authentication/cloudIntegrationService.js'
+						)
+					).CloudIntegrationService(this, this._connection);
+					return cloudIntegrations;
+				} catch (ex) {
+					Logger.error(ex);
+					return undefined;
+				}
+			}
+
+			this._cloudIntegrations = load.call(this);
+		}
+
+		return this._cloudIntegrations;
+	}
+
+	private _drafts: DraftService | undefined;
+	get drafts(): DraftService {
+		if (this._drafts == null) {
+			this._disposables.push((this._drafts = new DraftService(this, this._connection)));
+		}
+		return this._drafts;
+	}
+
+	private readonly _codeLensController: GitCodeLensController;
+	get codeLens(): GitCodeLensController {
 		return this._codeLensController;
 	}
 
-	private _branchesView: BranchesView | undefined;
-	get branchesView() {
-		if (this._branchesView == null) {
-			this._context.subscriptions.push((this._branchesView = new BranchesView(this)));
-		}
-
-		return this._branchesView;
-	}
-
-	private _commitsView: CommitsView | undefined;
-	get commitsView() {
-		if (this._commitsView == null) {
-			this._context.subscriptions.push((this._commitsView = new CommitsView(this)));
-		}
-
-		return this._commitsView;
-	}
-
-	private _config: Config | undefined;
-	get config() {
-		if (this._config == null) {
-			this._config = this.applyMode(configuration.get());
-		}
-		return this._config;
-	}
-
-	private _context: ExtensionContext;
-	get context() {
+	private readonly _context: ExtensionContext;
+	get context(): ExtensionContext {
 		return this._context;
 	}
 
-	private _contributorsView: ContributorsView | undefined;
-	get contributorsView() {
-		if (this._contributorsView == null) {
-			this._context.subscriptions.push((this._contributorsView = new ContributorsView(this)));
-		}
-
-		return this._contributorsView;
-	}
-
 	@memoize()
-	get debugging() {
+	get debugging(): boolean {
 		return this._context.extensionMode === ExtensionMode.Development;
 	}
 
+	private readonly _deepLinks: DeepLinkService;
+	get deepLinks(): DeepLinkService {
+		return this._deepLinks;
+	}
+
+	private readonly _documentTracker: GitDocumentTracker;
+	get documentTracker(): GitDocumentTracker {
+		return this._documentTracker;
+	}
+
+	private _enrichments: EnrichmentService | undefined;
+	get enrichments(): EnrichmentService {
+		if (this._enrichments == null) {
+			this._disposables.push((this._enrichments = new EnrichmentService(this, this._connection)));
+		}
+
+		return this._enrichments;
+	}
+
 	@memoize()
-	get env(): 'dev' | 'staging' | 'production' {
-		if (this.insiders || this.debugging) {
+	get env(): Environment {
+		if (this.prereleaseOrDebugging) {
 			const env = configuration.getAny('gitkraken.env');
 			if (env === 'dev') return 'dev';
 			if (env === 'staging') return 'staging';
@@ -328,147 +493,233 @@ export class Container {
 		return 'production';
 	}
 
-	private _fileAnnotationController: FileAnnotationController;
-	get fileAnnotations() {
+	private readonly _eventBus: EventBus;
+	get events(): EventBus {
+		return this._eventBus;
+	}
+
+	get extensionMode(): ExtensionMode {
+		return this._context.extensionMode;
+	}
+
+	private readonly _fileAnnotationController: FileAnnotationController;
+	get fileAnnotations(): FileAnnotationController {
 		return this._fileAnnotationController;
 	}
 
-	private _fileHistoryView: FileHistoryView | undefined;
-	get fileHistoryView() {
-		if (this._fileHistoryView == null) {
-			this._context.subscriptions.push((this._fileHistoryView = new FileHistoryView(this)));
-		}
-
-		return this._fileHistoryView;
+	private readonly _launchpadProvider: LaunchpadProvider;
+	get launchpad(): LaunchpadProvider {
+		return this._launchpadProvider;
 	}
 
-	private _git: GitProviderService;
-	get git() {
+	private readonly _markdownProvider: MarkdownContentProvider;
+	get markdown(): MarkdownContentProvider {
+		return this._markdownProvider;
+	}
+
+	private readonly _git: GitProviderService;
+	get git(): GitProviderService {
 		return this._git;
 	}
 
-	private _github: Promise<import('./premium/github/github').GitHubApi | undefined> | undefined;
-	get github() {
+	private _azure: Promise<AzureDevOpsApi | undefined> | undefined;
+	get azure(): Promise<AzureDevOpsApi | undefined> {
+		if (this._azure == null) {
+			async function load(this: Container) {
+				try {
+					const azure = new (
+						await import(
+							/* webpackChunkName: "integrations" */ './plus/integrations/providers/azure/azure.js'
+						)
+					).AzureDevOpsApi(this);
+					this._disposables.push(azure);
+					return azure;
+				} catch (ex) {
+					Logger.error(ex);
+					return undefined;
+				}
+			}
+
+			this._azure = load.call(this);
+		}
+
+		return this._azure;
+	}
+
+	private _bitbucket: Promise<BitbucketApi | undefined> | undefined;
+	get bitbucket(): Promise<BitbucketApi | undefined> {
+		if (this._bitbucket == null) {
+			async function load(this: Container) {
+				try {
+					const bitbucket = new (
+						await import(
+							/* webpackChunkName: "integrations" */ './plus/integrations/providers/bitbucket/bitbucket.js'
+						)
+					).BitbucketApi(this);
+					this._disposables.push(bitbucket);
+					return bitbucket;
+				} catch (ex) {
+					Logger.error(ex);
+					return undefined;
+				}
+			}
+
+			this._bitbucket = load.call(this);
+		}
+
+		return this._bitbucket;
+	}
+
+	private _github: Promise<GitHubApi | undefined> | undefined;
+	get github(): Promise<GitHubApi | undefined> {
 		if (this._github == null) {
-			this._github = this._loadGitHubApi();
+			async function load(this: Container) {
+				try {
+					const github = new (
+						await import(
+							/* webpackChunkName: "integrations" */ './plus/integrations/providers/github/github.js'
+						)
+					).GitHubApi(this);
+					this._disposables.push(github);
+					return github;
+				} catch (ex) {
+					Logger.error(ex);
+					return undefined;
+				}
+			}
+
+			this._github = load.call(this);
 		}
 
 		return this._github;
 	}
 
-	private async _loadGitHubApi() {
-		try {
-			return new (await import(/* webpackChunkName: "github" */ './premium/github/github')).GitHubApi();
-		} catch (ex) {
-			Logger.error(ex);
-			return undefined;
-		}
-	}
+	private _gitlab: Promise<GitLabApi | undefined> | undefined;
+	get gitlab(): Promise<GitLabApi | undefined> {
+		if (this._gitlab == null) {
+			async function load(this: Container) {
+				try {
+					const gitlab = new (
+						await import(
+							/* webpackChunkName: "integrations" */ './plus/integrations/providers/gitlab/gitlab.js'
+						)
+					).GitLabApi(this);
+					this._disposables.push(gitlab);
+					return gitlab;
+				} catch (ex) {
+					Logger.error(ex);
+					return undefined;
+				}
+			}
 
-	private _homeView: HomeWebviewView | undefined;
-	get homeView() {
-		if (this._homeView == null) {
-			this._context.subscriptions.push((this._homeView = new HomeWebviewView(this)));
+			this._gitlab = load.call(this);
 		}
 
-		return this._homeView;
+		return this._gitlab;
 	}
 
 	@memoize()
-	get insiders() {
-		return this._context.extension.id.endsWith('-insiders');
+	get id(): string {
+		return this._context.extension.id;
 	}
 
-	private _keyboard: Keyboard;
-	get keyboard() {
+	private _integrations: IntegrationService | undefined;
+	get integrations(): IntegrationService {
+		if (this._integrations == null) {
+			const configuredIntegrationService = new ConfiguredIntegrationService(this);
+			const authService = new IntegrationAuthenticationService(this, configuredIntegrationService);
+			this._disposables.push(
+				authService,
+				configuredIntegrationService,
+				(this._integrations = new IntegrationService(this, authService, configuredIntegrationService)),
+			);
+		}
+		return this._integrations;
+	}
+
+	private readonly _keyboard: Keyboard;
+	get keyboard(): Keyboard {
 		return this._keyboard;
 	}
 
-	private _lineAnnotationController: LineAnnotationController;
-	get lineAnnotations() {
+	private readonly _lineAnnotationController: LineAnnotationController;
+	get lineAnnotations(): LineAnnotationController {
 		return this._lineAnnotationController;
 	}
 
-	private _lineHistoryView: LineHistoryView | undefined;
-	get lineHistoryView() {
-		if (this._lineHistoryView == null) {
-			this._context.subscriptions.push((this._lineHistoryView = new LineHistoryView(this)));
-		}
-
-		return this._lineHistoryView;
-	}
-
-	private _lineHoverController: LineHoverController;
-	get lineHovers() {
+	private readonly _lineHoverController: LineHoverController;
+	get lineHovers(): LineHoverController {
 		return this._lineHoverController;
 	}
 
-	private _lineTracker: GitLineTracker;
-	get lineTracker() {
+	private readonly _lineTracker: LineTracker;
+	get lineTracker(): LineTracker {
 		return this._lineTracker;
 	}
 
-	private _rebaseEditor: RebaseEditorProvider | undefined;
-	get rebaseEditor() {
-		if (this._rebaseEditor == null) {
-			this._context.subscriptions.push((this._rebaseEditor = new RebaseEditorProvider(this)));
-		}
+	private _mode: Mode | undefined;
+	get mode(): Mode | undefined {
+		this._mode ??= configuration.get('modes')?.[configuration.get('mode.active')];
+		return this._mode;
+	}
 
+	private _organizations: OrganizationService;
+	get organizations(): OrganizationService {
+		return this._organizations;
+	}
+
+	private readonly _prerelease;
+	get prerelease(): boolean {
+		return this._prerelease;
+	}
+
+	@memoize()
+	get prereleaseOrDebugging(): boolean {
+		return this._prerelease || this.debugging;
+	}
+
+	private _productConfig: ProductConfigProvider | undefined;
+	get productConfig(): ProductConfigProvider {
+		this._productConfig ??= new ProductConfigProvider(this, this._connection);
+		return this._productConfig;
+	}
+
+	private readonly _rebaseEditor: RebaseEditorProvider;
+	get rebaseEditor(): RebaseEditorProvider {
 		return this._rebaseEditor;
 	}
 
-	private _remotesView: RemotesView | undefined;
-	get remotesView() {
-		if (this._remotesView == null) {
-			this._context.subscriptions.push((this._remotesView = new RemotesView(this)));
+	private _repositoryIdentity: RepositoryIdentityService | undefined;
+	get repositoryIdentity(): RepositoryIdentityService {
+		if (this._repositoryIdentity == null) {
+			this._disposables.push(
+				(this._repositoryIdentity = new RepositoryIdentityService(this, this.repositoryLocator)),
+			);
 		}
-
-		return this._remotesView;
+		return this._repositoryIdentity;
 	}
 
-	private _repositoriesView: RepositoriesView | undefined;
-	get repositoriesView(): RepositoriesView {
-		if (this._repositoriesView == null) {
-			this._context.subscriptions.push((this._repositoriesView = new RepositoriesView(this)));
+	private _repositoryLocator: RepositoryLocationProvider | null | undefined;
+	get repositoryLocator(): RepositoryLocationProvider | undefined {
+		if (this._repositoryLocator === undefined) {
+			this._repositoryLocator = getSupportedRepositoryLocationProvider(this, this.sharedGkStorage!) ?? null;
+			if (this._repositoryLocator != null) {
+				this._disposables.push(this._repositoryLocator);
+			}
 		}
-
-		return this._repositoriesView;
+		return this._repositoryLocator ?? undefined;
 	}
 
-	private _searchAndCompareView: SearchAndCompareView | undefined;
-	get searchAndCompareView() {
-		if (this._searchAndCompareView == null) {
-			this._context.subscriptions.push((this._searchAndCompareView = new SearchAndCompareView(this)));
+	private _sharedGkStorage: SharedGkStorageLocationProvider | null | undefined;
+	private get sharedGkStorage(): SharedGkStorageLocationProvider | undefined {
+		if (this._sharedGkStorage === undefined) {
+			this._sharedGkStorage = getSharedGKStorageLocationProvider(this) ?? null;
 		}
-
-		return this._searchAndCompareView;
+		return this._sharedGkStorage ?? undefined;
 	}
 
-	private _subscription: SubscriptionService | undefined;
-	get subscription() {
-		if (this._subscription == null) {
-			this._subscription = new SubscriptionService(this);
-		}
-
-		return this._subscription;
-	}
-
-	private _settingsWebview: SettingsWebview;
-	get settingsWebview() {
-		return this._settingsWebview;
-	}
-
-	private _stashesView: StashesView | undefined;
-	get stashesView() {
-		if (this._stashesView == null) {
-			this._context.subscriptions.push((this._stashesView = new StashesView(this)));
-		}
-
-		return this._stashesView;
-	}
-
-	private _statusBarController: StatusBarController;
-	get statusBar() {
+	private readonly _statusBarController: StatusBarController;
+	get statusBar(): StatusBarController {
 		return this._statusBarController;
 	}
 
@@ -477,82 +728,90 @@ export class Container {
 		return this._storage;
 	}
 
-	private _tagsView: TagsView | undefined;
-	get tagsView() {
-		if (this._tagsView == null) {
-			this._context.subscriptions.push((this._tagsView = new TagsView(this)));
-		}
-
-		return this._tagsView;
+	private _subscription: SubscriptionService;
+	get subscription(): SubscriptionService {
+		return this._subscription;
 	}
 
-	private _timelineView: TimelineWebviewView;
-	get timelineView() {
-		return this._timelineView;
+	private readonly _telemetry: TelemetryService;
+	get telemetry(): TelemetryService {
+		return this._telemetry;
 	}
 
-	private _timelineWebview: TimelineWebview;
-	get timelineWebview() {
-		return this._timelineWebview;
+	private readonly _uri: UriService;
+	get uri(): UriService {
+		return this._uri;
 	}
 
-	private _tracker: GitDocumentTracker;
-	get tracker() {
-		return this._tracker;
+	private readonly _urls: UrlsProvider;
+	get urls(): UrlsProvider {
+		return this._urls;
 	}
 
-	@memoize()
+	private readonly _usage: UsageTracker;
+	get usage(): UsageTracker {
+		return this._usage;
+	}
+
+	private readonly _walkthrough: WalkthroughStateProvider;
+	get walkthrough(): WalkthroughStateProvider {
+		return this._walkthrough;
+	}
+
+	private readonly _version: string;
 	get version(): string {
-		return this.context.extension.packageJSON.version;
+		return this._version;
 	}
 
-	private _viewCommands: ViewCommands | undefined;
-	get viewCommands() {
-		if (this._viewCommands == null) {
-			this._viewCommands = new ViewCommands(this);
-		}
-		return this._viewCommands;
+	private readonly _previousVersion: string | undefined;
+	get previousVersion(): string | undefined {
+		return this._previousVersion;
 	}
 
-	private _vsls: VslsController;
-	get vsls() {
+	private readonly _views: Views;
+	get views(): Views {
+		return this._views;
+	}
+
+	private readonly _vsls: VslsController;
+	get vsls(): VslsController {
 		return this._vsls;
 	}
 
-	private _welcomeWebview: WelcomeWebview;
-	get welcomeWebview() {
-		return this._welcomeWebview;
+	private _workspaces: WorkspacesService | undefined;
+	get workspaces(): WorkspacesService {
+		if (this._workspaces == null) {
+			this._disposables.push(
+				(this._workspaces = new WorkspacesService(
+					this,
+					new WorkspacesApi(this, this._connection),
+					getSupportedWorkspacesStorageProvider(this, this.sharedGkStorage!),
+					this.repositoryLocator,
+				)),
+			);
+		}
+		return this._workspaces;
 	}
 
-	private _worktreesView: WorktreesView | undefined;
-	get worktreesView() {
-		if (this._worktreesView == null) {
-			this._context.subscriptions.push((this._worktreesView = new WorktreesView(this)));
+	private ensureModeApplied() {
+		const mode = this.mode;
+		if (mode == null) {
+			configuration.clearOverrides();
+
+			return;
 		}
 
-		return this._worktreesView;
-	}
-
-	private applyMode(config: Config) {
-		if (!config.mode.active) return config;
-
-		const mode = config.modes?.[config.mode.active];
-		if (mode == null) return config;
-
 		if (mode.annotations != null) {
-			let command: Commands | undefined;
+			let command: GlCommands | undefined;
 			switch (mode.annotations) {
 				case 'blame':
-					config.blame.toggleMode = AnnotationsToggleMode.Window;
-					command = Commands.ToggleFileBlame;
+					command = 'gitlens.toggleFileBlame:mode';
 					break;
 				case 'changes':
-					config.changes.toggleMode = AnnotationsToggleMode.Window;
-					command = Commands.ToggleFileChanges;
+					command = 'gitlens.toggleFileChanges:mode';
 					break;
 				case 'heatmap':
-					config.heatmap.toggleMode = AnnotationsToggleMode.Window;
-					command = Commands.ToggleFileHeatmap;
+					command = 'gitlens.toggleFileHeatmap:mode';
 					break;
 			}
 
@@ -561,50 +820,82 @@ export class Container {
 					type: mode.annotations as FileAnnotationType,
 					on: true,
 				};
-				// Make sure to delay the execution by a bit so that the configuration changes get propegated first
-				setTimeout(() => executeCommand(command!, commandArgs), 50);
+				// Make sure to delay the execution by a bit so that the configuration changes get propagated first
+				setTimeout(executeCommand, 50, command, commandArgs);
 			}
 		}
 
-		if (mode.codeLens != null) {
-			config.codeLens.enabled = mode.codeLens;
-		}
+		// Apply any required configuration overrides
+		configuration.applyOverrides({
+			get: (section, value) => {
+				if (mode.annotations != null) {
+					if (configuration.matches(`${mode.annotations}.toggleMode`, section, value)) {
+						value = 'window' as typeof value;
+						return value;
+					}
 
-		if (mode.currentLine != null) {
-			config.currentLine.enabled = mode.currentLine;
-		}
+					if (configuration.matches(mode.annotations, section, value)) {
+						value.toggleMode = 'window';
+						return value;
+					}
+				}
 
-		if (mode.hovers != null) {
-			config.hovers.enabled = mode.hovers;
-		}
+				for (const key of ['codeLens', 'currentLine', 'hovers', 'statusBar'] as const) {
+					if (mode[key] != null) {
+						if (configuration.matches(`${key}.enabled`, section, value)) {
+							value = mode[key] as NonNullable<typeof value>;
+							return value;
+						} else if (configuration.matches(key, section, value)) {
+							value.enabled = mode[key]!;
+							return value;
+						}
+					}
+				}
 
-		if (mode.statusBar != null) {
-			config.statusBar.enabled = mode.statusBar;
-		}
+				return value;
+			},
+			getAll: cfg => {
+				if (mode.annotations != null) {
+					cfg[mode.annotations].toggleMode = 'window';
+				}
 
-		return config;
+				if (mode.codeLens != null) {
+					cfg.codeLens.enabled = mode.codeLens;
+				}
+
+				if (mode.currentLine != null) {
+					cfg.currentLine.enabled = mode.currentLine;
+				}
+
+				if (mode.hovers != null) {
+					cfg.hovers.enabled = mode.hovers;
+				}
+
+				if (mode.statusBar != null) {
+					cfg.statusBar.enabled = mode.statusBar;
+				}
+
+				return cfg;
+			},
+			onDidChange: e => {
+				// When the mode or modes change, we will simulate that all the affected configuration also changed
+				if (!configuration.changed(e, ['mode', 'modes'])) return e;
+
+				const originalAffectsConfiguration = e.affectsConfiguration;
+				return {
+					...e,
+					affectsConfiguration: (section, scope) =>
+						/^gitlens\.(?:modes?|blame|changes|heatmap|codeLens|currentLine|hovers|statusBar)\b/.test(
+							section,
+						)
+							? true
+							: originalAffectsConfiguration(section, scope),
+				};
+			},
+		});
 	}
+}
 
-	private applyModeConfigurationTransform(e: ConfigurationChangeEvent): ConfigurationChangeEvent {
-		if (this._configsAffectedByMode == null) {
-			this._configsAffectedByMode = [
-				`gitlens.${configuration.name('mode')}`,
-				`gitlens.${configuration.name('modes')}`,
-				`gitlens.${configuration.name('blame.toggleMode')}`,
-				`gitlens.${configuration.name('changes.toggleMode')}`,
-				`gitlens.${configuration.name('codeLens')}`,
-				`gitlens.${configuration.name('currentLine')}`,
-				`gitlens.${configuration.name('heatmap.toggleMode')}`,
-				`gitlens.${configuration.name('hovers')}`,
-				`gitlens.${configuration.name('statusBar')}`,
-			];
-		}
-
-		const original = e.affectsConfiguration;
-		return {
-			...e,
-			affectsConfiguration: (section: string, scope?: ConfigurationScope) =>
-				this._configsAffectedByMode?.some(n => section.startsWith(n)) ? true : original(section, scope),
-		};
-	}
+export function isContainer(container: any): container is Container {
+	return container instanceof Container;
 }

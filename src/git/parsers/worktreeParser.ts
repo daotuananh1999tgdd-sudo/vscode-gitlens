@@ -1,8 +1,10 @@
 import { Uri } from 'vscode';
-import { debug } from '../../system/decorators/log';
-import { normalizePath } from '../../system/path';
-import { getLines } from '../../system/string';
-import { GitWorktree } from '../models/worktree';
+import type { Container } from '../../container.js';
+import { normalizePath } from '../../system/path.js';
+import { maybeStopWatch } from '../../system/stopwatch.js';
+import { iterateByDelimiter } from '../../system/string.js';
+import type { GitBranch } from '../models/branch.js';
+import { GitWorktree } from '../models/worktree.js';
 
 interface WorktreeEntry {
 	path: string;
@@ -14,79 +16,97 @@ interface WorktreeEntry {
 	prunable?: boolean | string;
 }
 
-export class GitWorktreeParser {
-	@debug({ args: false, singleLine: true })
-	static parse(data: string, repoPath: string): GitWorktree[] {
-		if (!data) return [];
+export function parseGitWorktrees(
+	container: Container,
+	data: string | undefined,
+	repoPath: string,
+	branches: GitBranch[],
+): GitWorktree[] {
+	using sw = maybeStopWatch(`Git.parseWorktrees(${repoPath})`, { log: { onlyExit: true, level: 'debug' } });
 
-		if (repoPath != null) {
-			repoPath = normalizePath(repoPath);
-		}
-
-		const worktrees: GitWorktree[] = [];
-
-		let entry: Partial<WorktreeEntry> | undefined = undefined;
-		let line: string;
-		let key: string;
-		let value: string;
-		let locked: string;
-		let prunable: string;
-		let main = true; // the first worktree is the main worktree
-
-		for (line of getLines(data)) {
-			[key, value] = line.split(' ', 2);
-
-			if (key.length === 0 && entry != null) {
-				worktrees.push(
-					new GitWorktree(
-						main,
-						entry.bare ? 'bare' : entry.detached ? 'detached' : 'branch',
-						repoPath,
-						Uri.file(entry.path!),
-						entry.locked ?? false,
-						entry.prunable ?? false,
-						entry.sha,
-						entry.branch,
-					),
-				);
-
-				entry = undefined;
-				main = false;
-				continue;
-			}
-
-			if (entry == null) {
-				entry = {};
-			}
-
-			switch (key) {
-				case 'worktree':
-					entry.path = value;
-					break;
-				case 'bare':
-					entry.bare = true;
-					break;
-				case 'HEAD':
-					entry.sha = value;
-					break;
-				case 'branch':
-					// Strip off refs/heads/
-					entry.branch = value.substr(11);
-					break;
-				case 'detached':
-					entry.detached = true;
-					break;
-				case 'locked':
-					[, locked] = value.split(' ', 2);
-					entry.locked = locked?.trim() || true;
-					break;
-				case 'prunable':
-					[, prunable] = value.split(' ', 2);
-					entry.prunable = prunable?.trim() || true;
-					break;
-			}
-		}
-
+	const worktrees: GitWorktree[] = [];
+	if (!data) {
+		sw?.stop({ suffix: ` no data` });
 		return worktrees;
 	}
+
+	if (repoPath != null) {
+		repoPath = normalizePath(repoPath);
+	}
+
+	let entry: Partial<WorktreeEntry> | undefined = undefined;
+	let line: string;
+	let index: number;
+	let key: string;
+	let value: string;
+	let locked: string;
+	let prunable: string;
+	let main = true; // the first worktree is the main worktree
+
+	for (line of iterateByDelimiter(data, '\n')) {
+		index = line.indexOf(' ');
+		if (index === -1) {
+			key = line;
+			value = '';
+		} else {
+			key = line.substring(0, index);
+			value = line.substring(index + 1);
+		}
+
+		if (!key && entry != null) {
+			// eslint-disable-next-line no-loop-func
+			const branch = entry.branch ? branches?.find(b => b.name === entry!.branch) : undefined;
+
+			worktrees.push(
+				new GitWorktree(
+					container,
+					main,
+					entry.bare ? 'bare' : entry.detached ? 'detached' : 'branch',
+					repoPath,
+					Uri.file(entry.path!),
+					entry.locked ?? false,
+					entry.prunable ?? false,
+					entry.sha,
+					branch,
+				),
+			);
+
+			entry = undefined;
+			main = false;
+			continue;
+		}
+
+		entry ??= {};
+
+		switch (key) {
+			case 'worktree':
+				entry.path = value;
+				break;
+			case 'bare':
+				entry.bare = true;
+				break;
+			case 'HEAD':
+				entry.sha = value;
+				break;
+			case 'branch':
+				// Strip off refs/heads/
+				entry.branch = value.substring(11);
+				break;
+			case 'detached':
+				entry.detached = true;
+				break;
+			case 'locked':
+				[, locked] = value.split(' ', 2);
+				entry.locked = locked?.trim() || true;
+				break;
+			case 'prunable':
+				[, prunable] = value.split(' ', 2);
+				entry.prunable = prunable?.trim() || true;
+				break;
+		}
+	}
+
+	sw?.stop({ suffix: ` parsed ${worktrees.length} worktrees` });
+
+	return worktrees;
 }

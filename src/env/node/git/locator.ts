@@ -1,15 +1,14 @@
 import { join as joinPaths } from 'path';
-import { GlyphChars } from '../../../constants';
-import { LogLevel } from '../../../logger';
-import { any } from '../../../system/promise';
-import { Stopwatch } from '../../../system/stopwatch';
-import { findExecutable, run } from './shell';
+import * as process from 'process';
+import { any } from '../../../system/promise.js';
+import { maybeStopWatch } from '../../../system/stopwatch.js';
+import { findExecutable, run } from './shell.js';
 
 export class UnableToFindGitError extends Error {
 	constructor(public readonly original?: Error) {
 		super('Unable to find git');
 
-		Error.captureStackTrace?.(this, UnableToFindGitError);
+		Error.captureStackTrace?.(this, new.target);
 	}
 }
 
@@ -17,7 +16,7 @@ export class InvalidGitConfigError extends Error {
 	constructor(public readonly original: Error) {
 		super('Invalid Git configuration');
 
-		Error.captureStackTrace?.(this, InvalidGitConfigError);
+		Error.captureStackTrace?.(this, new.target);
 	}
 }
 
@@ -26,18 +25,17 @@ export interface GitLocation {
 	version: string;
 }
 
-function parseVersion(raw: string): string {
-	return raw?.replace(/^git version /, '');
-}
-
 async function findSpecificGit(path: string): Promise<GitLocation> {
-	const sw = new Stopwatch(`findSpecificGit(${path})`, { logLevel: LogLevel.Debug });
+	const sw = maybeStopWatch(`findSpecificGit(path=${path})`, {
+		log: { level: 'debug', onlyExit: true },
+		scopeLabel: 'GIT',
+	});
 
 	let version;
 	try {
-		version = await run<string>(path, ['--version'], 'utf8');
+		version = await run(path, ['--version'], 'utf8');
 	} catch (ex) {
-		sw.stop({ message: ` ${GlyphChars.Dot} Unable to find git` });
+		sw?.stop({ message: `\u2022 Unable to find git: ${ex}` });
 
 		if (/bad config/i.test(ex.message)) throw new InvalidGitConfigError(ex);
 		throw ex;
@@ -45,13 +43,13 @@ async function findSpecificGit(path: string): Promise<GitLocation> {
 
 	// If needed, let's update our path to avoid the search on every command
 	if (!path || path === 'git') {
-		const foundPath = findExecutable(path, ['--version']).cmd;
+		const foundPath = (await findExecutable(path, ['--version'])).cmd;
 
 		// Ensure that the path we found works
 		try {
-			version = await run<string>(foundPath, ['--version'], 'utf8');
+			version = await run(foundPath, ['--version'], 'utf8');
 		} catch (ex) {
-			sw.stop({ message: ` ${GlyphChars.Dot} Unable to find git` });
+			sw?.stop({ message: `\u2022 Unable to find git: ${ex}` });
 
 			if (/bad config/i.test(ex.message)) throw new InvalidGitConfigError(ex);
 			throw ex;
@@ -60,27 +58,32 @@ async function findSpecificGit(path: string): Promise<GitLocation> {
 		path = foundPath;
 	}
 
-	sw.stop({ message: ` ${GlyphChars.Dot} Found git @ ${path}` });
+	const parsed = version
+		.trim()
+		.replace(/^git version /, '')
+		.trim();
+
+	sw?.stop({ message: `\u2022 Found git v${parsed} in ${path}` });
 
 	return {
 		path: path,
-		version: parseVersion(version.trim()),
+		version: parsed,
 	};
 }
 
 async function findGitDarwin(): Promise<GitLocation> {
 	try {
-		const path = (await run<string>('which', ['git'], 'utf8')).trim();
-		if (path !== '/usr/bin/git') return findSpecificGit(path);
+		const path = (await run('which', ['git'], 'utf8')).trim();
+		if (path !== '/usr/bin/git') return await findSpecificGit(path);
 
 		try {
-			await run<string>('xcode-select', ['-p'], 'utf8');
-			return findSpecificGit(path);
+			await run('xcode-select', ['-p'], 'utf8');
+			return await findSpecificGit(path);
 		} catch (ex) {
 			if (ex.code === 2) {
-				return Promise.reject(new UnableToFindGitError(ex));
+				return await Promise.reject(new UnableToFindGitError(ex));
 			}
-			return findSpecificGit(path);
+			return await findSpecificGit(path);
 		}
 	} catch (ex) {
 		return Promise.reject(
@@ -113,7 +116,7 @@ export async function findGitPath(
 		}
 
 		try {
-			return any(...paths.map(p => findSpecificGit(p)));
+			return await any(...paths.map(p => findSpecificGit(p)));
 		} catch (ex) {
 			throw new UnableToFindGitError(ex);
 		}
@@ -133,7 +136,7 @@ export async function findGitPath(
 				case 'win32':
 					return await findGitWin32();
 				default:
-					return Promise.reject(new UnableToFindGitError());
+					return await Promise.reject(new UnableToFindGitError());
 			}
 		} catch (ex) {
 			return Promise.reject(

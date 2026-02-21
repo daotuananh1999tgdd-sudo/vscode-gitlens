@@ -1,25 +1,38 @@
-import { TextDocumentShowOptions, TextEditor, Uri } from 'vscode';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { GitCommit } from '../git/models';
-import { Logger } from '../logger';
-import { Messages } from '../messages';
-import { command, executeCommand } from '../system/command';
-import { ActiveEditorCommand, getCommandUri } from './base';
-import { DiffWithCommandArgs } from './diffWith';
+import type { TextDocumentShowOptions, TextEditor, Uri } from 'vscode';
+import type { Container } from '../container.js';
+import type { DiffRange } from '../git/gitProvider.js';
+import { GitUri } from '../git/gitUri.js';
+import type { GitCommit } from '../git/models/commit.js';
+import { showCommitHasNoPreviousCommitWarningMessage, showGenericErrorMessage } from '../messages.js';
+import { command, executeCommand } from '../system/-webview/command.js';
+import { selectionToDiffRange } from '../system/-webview/vscode/editors.js';
+import { getTabUris, getVisibleTabs } from '../system/-webview/vscode/tabs.js';
+import { Logger } from '../system/logger.js';
+import { areUrisEqual } from '../system/uri.js';
+import { ActiveEditorCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
+import type { CommandContext } from './commandContext.js';
+import type { DiffWithCommandArgs } from './diffWith.js';
 
 export interface DiffLineWithPreviousCommandArgs {
 	commit?: GitCommit;
 
-	line?: number;
+	range?: DiffRange;
 	showOptions?: TextDocumentShowOptions;
 }
 
 @command()
 export class DiffLineWithPreviousCommand extends ActiveEditorCommand {
 	constructor(private readonly container: Container) {
-		super(Commands.DiffLineWithPrevious);
+		super('gitlens.diffLineWithPrevious');
+	}
+
+	protected override preExecute(context: CommandContext, args?: DiffLineWithPreviousCommandArgs): Promise<any> {
+		if (context.type === 'editorLine') {
+			args = { ...args, range: { startLine: context.line, endLine: context.line } };
+		}
+
+		return this.execute(context.editor, context.uri, args);
 	}
 
 	async execute(editor?: TextEditor, uri?: Uri, args?: DiffLineWithPreviousCommandArgs): Promise<any> {
@@ -27,37 +40,46 @@ export class DiffLineWithPreviousCommand extends ActiveEditorCommand {
 		if (uri == null) return;
 
 		args = { ...args };
-		if (args.line == null) {
-			args.line = editor?.selection.active.line ?? 0;
-		}
+		args.range ??= selectionToDiffRange(editor?.selection);
 
 		const gitUri = args.commit?.getGitUri() ?? (await GitUri.fromUri(uri));
 
-		try {
-			const diffUris = await this.container.git.getPreviousComparisonUrisForLine(
-				gitUri.repoPath!,
-				gitUri,
-				args.line,
-				gitUri.sha,
-			);
+		let skipFirstRev = false;
 
-			if (diffUris == null || diffUris.previous == null) {
-				void Messages.showCommitHasNoPreviousCommitWarningMessage();
+		// Figure out if we are in a diff editor and if so, which side
+		const [tab] = getVisibleTabs(uri);
+		if (tab != null) {
+			const uris = getTabUris(tab);
+			// If there is an original, then we are in a diff editor -- modified is right, original is left
+			if (uris.original != null) {
+				skipFirstRev = areUrisEqual(uri, uris.modified);
+			}
+		}
+
+		try {
+			const diffUris = await this.container.git
+				.getRepositoryService(gitUri.repoPath!)
+				.diff.getPreviousComparisonUrisForRange(gitUri, gitUri.sha, args.range, {
+					skipFirstRev: skipFirstRev,
+				});
+
+			if (diffUris?.previous == null) {
+				void showCommitHasNoPreviousCommitWarningMessage();
 
 				return;
 			}
 
-			void (await executeCommand<DiffWithCommandArgs>(Commands.DiffWith, {
+			void (await executeCommand<DiffWithCommandArgs>('gitlens.diffWith', {
 				repoPath: diffUris.current.repoPath,
 				lhs: {
 					sha: diffUris.previous.sha ?? '',
-					uri: diffUris.previous.documentUri(),
+					uri: diffUris.previous.documentUri,
 				},
 				rhs: {
 					sha: diffUris.current.sha ?? '',
-					uri: diffUris.current.documentUri(),
+					uri: diffUris.current.documentUri,
 				},
-				line: diffUris.line,
+				range: diffUris.range,
 				showOptions: args.showOptions,
 			}));
 		} catch (ex) {
@@ -66,7 +88,7 @@ export class DiffLineWithPreviousCommand extends ActiveEditorCommand {
 				'DiffLineWithPreviousCommand',
 				`getPreviousLineDiffUris(${gitUri.repoPath}, ${gitUri.fsPath}, ${gitUri.sha})`,
 			);
-			void Messages.showGenericErrorMessage('Unable to open compare');
+			void showGenericErrorMessage('Unable to open compare');
 		}
 	}
 }

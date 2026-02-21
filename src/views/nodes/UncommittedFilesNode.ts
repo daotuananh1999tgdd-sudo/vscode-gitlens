@@ -1,75 +1,55 @@
-'use strict';
 import { ThemeIcon, TreeItem, TreeItemCollapsibleState } from 'vscode';
-import { ViewFilesLayout } from '../../config';
-import { GitUri } from '../../git/gitUri';
-import {
-	GitCommit,
-	GitCommitIdentity,
-	GitFileChange,
-	GitFileWithCommit,
-	GitRevision,
-	GitStatus,
-	GitStatusFile,
-	GitTrackingState,
-} from '../../git/models';
-import { groupBy, makeHierarchical } from '../../system/array';
-import { flatMap } from '../../system/iterable';
-import { joinPaths, normalizePath } from '../../system/path';
-import { RepositoriesView } from '../repositoriesView';
-import { WorktreesView } from '../worktreesView';
-import { FileNode, FolderNode } from './folderNode';
-import { RepositoryNode } from './repositoryNode';
-import { UncommittedFileNode } from './UncommittedFileNode';
-import { ContextValues, ViewNode } from './viewNode';
+import { GitUri } from '../../git/gitUri.js';
+import type { GitFileWithCommit } from '../../git/models/file.js';
+import type { GitStatus } from '../../git/models/status.js';
+import { makeHierarchical } from '../../system/array.js';
+import { flatMap, groupBy } from '../../system/iterable.js';
+import type { Lazy } from '../../system/lazy.js';
+import { joinPaths, normalizePath } from '../../system/path.js';
+import type { ViewsWithWorkingTree } from '../viewBase.js';
+import { ContextValues, getViewNodeId, ViewNode } from './abstract/viewNode.js';
+import type { FileNode } from './folderNode.js';
+import { FolderNode } from './folderNode.js';
+import { UncommittedFileNode } from './UncommittedFileNode.js';
 
-export class UncommittedFilesNode extends ViewNode<RepositoriesView | WorktreesView> {
-	static key = ':uncommitted-files';
-	static getId(repoPath: string): string {
-		return `${RepositoryNode.getId(repoPath)}${this.key}`;
-	}
-
-	readonly repoPath: string;
-
+export class UncommittedFilesNode extends ViewNode<'uncommitted-files', ViewsWithWorkingTree> {
 	constructor(
-		view: RepositoriesView | WorktreesView,
-		parent: ViewNode,
-		public readonly status:
-			| GitStatus
-			| {
-					readonly repoPath: string;
-					readonly files: GitStatusFile[];
-					readonly state: GitTrackingState;
-					readonly upstream?: string;
-			  },
+		view: ViewsWithWorkingTree,
+		protected override readonly parent: ViewNode,
+		public readonly repoPath: string,
+		private readonly status: Lazy<Promise<GitStatus | undefined>>,
 		public readonly range: string | undefined,
 	) {
-		super(GitUri.fromRepoPath(status.repoPath), view, parent);
-		this.repoPath = status.repoPath;
+		super('uncommitted-files', GitUri.fromRepoPath(repoPath), view, parent);
+
+		this._uniqueId = getViewNodeId(this.type, this.context);
 	}
 
 	override get id(): string {
-		return UncommittedFilesNode.getId(this.repoPath);
+		return this._uniqueId;
 	}
 
-	getChildren(): ViewNode[] {
+	async getChildren(): Promise<ViewNode[]> {
 		const repoPath = this.repoPath;
 
+		const status = await this.status.value;
+		if (status == null) return [];
+
 		const files: GitFileWithCommit[] = [
-			...flatMap(this.status.files, f => {
-				if (f.workingTreeStatus != null && f.indexStatus != null) {
-					// Decrements the date to guarantee this entry will be sorted after the previous entry (most recent first)
-					const older = new Date();
-					older.setMilliseconds(older.getMilliseconds() - 1);
-
-					return [
-						this.getFileWithPseudoCommit(f, GitRevision.uncommitted, GitRevision.uncommittedStaged),
-						this.getFileWithPseudoCommit(f, GitRevision.uncommittedStaged, 'HEAD', older),
-					];
-				} else if (f.indexStatus != null) {
-					return [this.getFileWithPseudoCommit(f, GitRevision.uncommittedStaged, 'HEAD')];
-				}
-
-				return [this.getFileWithPseudoCommit(f, GitRevision.uncommitted, 'HEAD')];
+			...flatMap(status.files, f => {
+				const commits = f.getPseudoCommits(this.view.container, undefined);
+				return commits.map(
+					c =>
+						({
+							status: f.status,
+							repoPath: f.repoPath,
+							indexStatus: f.indexStatus,
+							workingTreeStatus: f.workingTreeStatus,
+							path: f.path,
+							originalPath: f.originalPath,
+							commit: c,
+						}) satisfies GitFileWithCommit,
+				);
 			}),
 		];
 
@@ -78,10 +58,10 @@ export class UncommittedFilesNode extends ViewNode<RepositoriesView | WorktreesV
 		const groups = groupBy(files, f => f.path);
 
 		let children: FileNode[] = Object.values(groups).map(
-			files => new UncommittedFileNode(this.view, this, repoPath, files[files.length - 1]),
+			files => new UncommittedFileNode(this.view, this, repoPath, files.at(-1)!),
 		);
 
-		if (this.view.config.files.layout !== ViewFilesLayout.List) {
+		if (this.view.config.files.layout !== 'list') {
 			const hierarchy = makeHierarchical(
 				children,
 				n => n.uri.relativePath.split('/'),
@@ -89,7 +69,7 @@ export class UncommittedFilesNode extends ViewNode<RepositoriesView | WorktreesV
 				this.view.config.files.compact,
 			);
 
-			const root = new FolderNode(this.view, this, repoPath, '', hierarchy, true);
+			const root = new FolderNode(this.view, this, hierarchy, repoPath, '', undefined, true);
 			children = root.getChildren() as FileNode[];
 		} else {
 			children.sort(
@@ -109,35 +89,5 @@ export class UncommittedFilesNode extends ViewNode<RepositoriesView | WorktreesV
 		item.iconPath = new ThemeIcon('folder');
 
 		return item;
-	}
-
-	private getFileWithPseudoCommit(
-		file: GitStatusFile,
-		ref: string,
-		previousRef: string,
-		date?: Date,
-	): GitFileWithCommit {
-		date = date ?? new Date();
-		return {
-			status: file.status,
-			repoPath: file.repoPath,
-			indexStatus: file.indexStatus,
-			workingTreeStatus: file.workingTreeStatus,
-			path: file.path,
-			originalPath: file.originalPath,
-			commit: new GitCommit(
-				this.view.container,
-				file.repoPath,
-				ref,
-				new GitCommitIdentity('You', undefined, date),
-				new GitCommitIdentity('You', undefined, date),
-				'Uncommitted changes',
-				[previousRef],
-				'Uncommitted changes',
-				new GitFileChange(file.repoPath, file.path, file.status, file.originalPath, previousRef),
-				undefined,
-				[],
-			),
-		};
 	}
 }

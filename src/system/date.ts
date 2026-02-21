@@ -1,24 +1,48 @@
 // NOTE@eamodio If this changes we need to update the replacement function too (since its parameter number/order relies on the matching)
 const customDateTimeFormatParserRegex =
 	/(?<literal>\[.*?\])|(?<year>YYYY|YY)|(?<month>M{1,4})|(?<day>Do|DD?)|(?<weekday>d{2,4})|(?<hour>HH?|hh?)|(?<minute>mm?)|(?<second>ss?)|(?<fractionalSecond>SSS)|(?<dayPeriod>A|a)|(?<timeZoneName>ZZ?)/g;
-const dateTimeFormatCache = new Map<string | undefined, Intl.DateTimeFormat>();
 const dateTimeFormatRegex = /(?<dateStyle>full|long|medium|short)(?:\+(?<timeStyle>full|long|medium|short))?/;
-let defaultRelativeTimeFormat: InstanceType<typeof Intl.RelativeTimeFormat> | undefined;
-let defaultShortRelativeTimeFormat: InstanceType<typeof Intl.RelativeTimeFormat> | undefined;
-let locale: string | undefined;
-const relativeUnitThresholds: [Intl.RelativeTimeFormatUnit, number, string][] = [
-	['year', 24 * 60 * 60 * 1000 * 365, 'yr'],
-	['month', (24 * 60 * 60 * 1000 * 365) / 12, 'mo'],
-	['week', 24 * 60 * 60 * 1000 * 7, 'wk'],
-	['day', 24 * 60 * 60 * 1000, 'd'],
-	['hour', 60 * 60 * 1000, 'h'],
-	['minute', 60 * 1000, 'm'],
-	['second', 1000, 's'],
+const relativeUnitThresholds: [Intl.RelativeTimeFormatUnit, number, number, string][] = [
+	['year', 24 * 60 * 60 * 1000 * (365 * 2 - 1), 24 * 60 * 60 * 1000 * 365, 'yr'],
+	['month', (24 * 60 * 60 * 1000 * 365) / 12, (24 * 60 * 60 * 1000 * 365) / 12, 'mo'],
+	['week', 24 * 60 * 60 * 1000 * 7, 24 * 60 * 60 * 1000 * 7, 'wk'],
+	['day', 24 * 60 * 60 * 1000, 24 * 60 * 60 * 1000, 'd'],
+	['hour', 60 * 60 * 1000, 60 * 60 * 1000, 'h'],
+	['minute', 60 * 1000, 60 * 1000, 'm'],
+	['second', 1000, 1000, 's'],
 ];
 
 type DateStyle = 'full' | 'long' | 'medium' | 'short';
 type TimeStyle = 'full' | 'long' | 'medium' | 'short';
 export type DateTimeFormat = DateStyle | `${DateStyle}+${TimeStyle}`;
+
+let locale: string | undefined;
+const dateTimeFormatCache = new Map<string | undefined, Intl.DateTimeFormat>();
+let defaultLocales: string[] | undefined;
+let defaultRelativeTimeFormat: InstanceType<typeof Intl.RelativeTimeFormat> | undefined;
+let defaultShortRelativeTimeFormat: InstanceType<typeof Intl.RelativeTimeFormat> | undefined;
+
+const numberFormatCache = new Map<string | undefined, Intl.NumberFormat>();
+
+export function setDefaultDateLocales(locales: string | string[] | null | undefined): void {
+	if (typeof locales === 'string') {
+		if (locales === 'system' || locales.trim().length === 0) {
+			defaultLocales = undefined;
+		} else {
+			defaultLocales = [locales];
+		}
+	} else {
+		defaultLocales = locales ?? undefined;
+	}
+
+	defaultRelativeTimeFormat = undefined;
+	defaultShortRelativeTimeFormat = undefined;
+	dateTimeFormatCache.clear();
+
+	numberFormatCache.clear();
+
+	locale = undefined;
+}
 
 export function createFromDateDelta(
 	date: Date,
@@ -54,10 +78,10 @@ export function createFromDateDelta(
 	return d;
 }
 
-export function fromNow(date: Date, short?: boolean): string {
-	const elapsed = date.getTime() - new Date().getTime();
+export function fromNow(date: Date | number, short?: boolean): string {
+	const elapsed = (typeof date === 'number' ? date : date.getTime()) - Date.now();
 
-	for (const [unit, threshold, shortUnit] of relativeUnitThresholds) {
+	for (const [unit, threshold, divisor, shortUnit] of relativeUnitThresholds) {
 		const elapsedABS = Math.abs(elapsed);
 		if (elapsedABS >= threshold || threshold === 1000 /* second */) {
 			if (short) {
@@ -67,7 +91,7 @@ export function fromNow(date: Date, short?: boolean): string {
 					} else if (defaultRelativeTimeFormat != null) {
 						locale = defaultRelativeTimeFormat.resolvedOptions().locale;
 					} else {
-						defaultShortRelativeTimeFormat = new Intl.RelativeTimeFormat(undefined, {
+						defaultShortRelativeTimeFormat = new Intl.RelativeTimeFormat(defaultLocales, {
 							localeMatcher: 'best fit',
 							numeric: 'always',
 							style: 'narrow',
@@ -77,47 +101,87 @@ export function fromNow(date: Date, short?: boolean): string {
 				}
 
 				if (locale === 'en' || locale?.startsWith('en-')) {
-					const value = Math.round(elapsedABS / threshold);
+					const value = Math.floor(elapsedABS / divisor);
 					return `${value}${shortUnit}`;
 				}
 
-				if (defaultShortRelativeTimeFormat == null) {
-					defaultShortRelativeTimeFormat = new Intl.RelativeTimeFormat(undefined, {
-						localeMatcher: 'best fit',
-						numeric: 'always',
-						style: 'narrow',
-					});
-				}
-
-				return defaultShortRelativeTimeFormat.format(Math.round(elapsed / threshold), unit);
-			}
-
-			if (defaultRelativeTimeFormat == null) {
-				defaultRelativeTimeFormat = new Intl.RelativeTimeFormat(undefined, {
+				defaultShortRelativeTimeFormat ??= new Intl.RelativeTimeFormat(defaultLocales, {
 					localeMatcher: 'best fit',
-					numeric: 'auto',
-					style: 'long',
+					numeric: 'always',
+					style: 'narrow',
 				});
+
+				return defaultShortRelativeTimeFormat.format(Math.trunc(elapsed / divisor), unit);
 			}
-			return defaultRelativeTimeFormat.format(Math.round(elapsed / threshold), unit);
+
+			defaultRelativeTimeFormat ??= new Intl.RelativeTimeFormat(defaultLocales, {
+				localeMatcher: 'best fit',
+				numeric: 'auto',
+				style: 'long',
+			});
+			return defaultRelativeTimeFormat.format(Math.trunc(elapsed / divisor), unit);
 		}
 	}
 
 	return '';
 }
 
-export function formatDate(date: Date, format: 'full' | 'long' | 'medium' | 'short' | string | null | undefined) {
+export function formatDate(
+	date: Date | number,
+	format: 'full' | 'long' | 'medium' | 'short' | string | null | undefined,
+	locale?: string,
+	cache: boolean = true,
+): string {
 	format = format ?? undefined;
 
-	let formatter = dateTimeFormatCache.get(format);
+	const key = `${locale ?? ''}:${format}`;
+
+	let formatter = dateTimeFormatCache.get(key);
 	if (formatter == null) {
 		const options = getDateTimeFormatOptionsFromFormatString(format);
-		formatter = new Intl.DateTimeFormat(undefined, options);
-		dateTimeFormatCache.set(format, formatter);
+
+		let locales;
+		if (locale == null) {
+			locales = defaultLocales;
+		} else if (locale === 'system') {
+			locales = undefined;
+		} else {
+			locales = [locale];
+		}
+
+		formatter = new Intl.DateTimeFormat(locales, options);
+		if (cache) {
+			dateTimeFormatCache.set(key, formatter);
+		}
 	}
 
 	if (format == null || dateTimeFormatRegex.test(format)) {
 		return formatter.format(date);
+	}
+
+	function getTimeFormatter(format: TimeStyle) {
+		const key = `${locale ?? ''}:time:${format}`;
+
+		let formatter = dateTimeFormatCache.get(key);
+		if (formatter == null) {
+			const options: Intl.DateTimeFormatOptions = { localeMatcher: 'best fit', timeStyle: format };
+
+			let locales;
+			if (locale == null) {
+				locales = defaultLocales;
+			} else if (locale === 'system') {
+				locales = undefined;
+			} else {
+				locales = [locale];
+			}
+
+			formatter = new Intl.DateTimeFormat(locales, options);
+			if (cache) {
+				dateTimeFormatCache.set(key, formatter);
+			}
+		}
+
+		return formatter;
 	}
 
 	const parts = formatter.formatToParts(date);
@@ -142,8 +206,7 @@ export function formatDate(date: Date, format: 'full' | 'long' | 'medium' | 'sho
 		) => {
 			if (literal != null) return (literal as string).substring(1, literal.length - 1);
 
-			for (const key in groups) {
-				const value = groups[key];
+			for (const [key, value] of Object.entries(groups)) {
 				if (value == null) continue;
 
 				const part = parts.find(p => p.type === key);
@@ -151,7 +214,11 @@ export function formatDate(date: Date, format: 'full' | 'long' | 'medium' | 'sho
 				if (value === 'Do' && part?.type === 'day') {
 					return formatWithOrdinal(Number(part.value));
 				} else if (value === 'a' && part?.type === 'dayPeriod') {
-					return part.value.toLocaleLowerCase();
+					// For some reason the Intl.DateTimeFormat doesn't honor the `dayPeriod` value and always returns the long version, so use the "short" timeStyle instead
+					const dayPeriod = getTimeFormatter('short')
+						.formatToParts(date)
+						.find(p => p.type === 'dayPeriod');
+					return ` ${(dayPeriod ?? part)?.value ?? ''}`;
 				}
 				return part?.value ?? '';
 			}
@@ -165,19 +232,21 @@ export function getDateDifference(
 	first: Date | number,
 	second: Date | number,
 	unit?: 'days' | 'hours' | 'minutes' | 'seconds',
+	roundFn?: (value: number) => number,
 ): number {
 	const diff =
 		(typeof second === 'number' ? second : second.getTime()) -
 		(typeof first === 'number' ? first : first.getTime());
+	const round = roundFn ?? Math.floor;
 	switch (unit) {
 		case 'days':
-			return Math.floor(diff / (1000 * 60 * 60 * 24));
+			return round(diff / (1000 * 60 * 60 * 24));
 		case 'hours':
-			return Math.floor(diff / (1000 * 60 * 60));
+			return round(diff / (1000 * 60 * 60));
 		case 'minutes':
-			return Math.floor(diff / (1000 * 60));
+			return round(diff / (1000 * 60));
 		case 'seconds':
-			return Math.floor(diff / 1000);
+			return round(diff / 1000);
 		default:
 			return diff;
 	}
@@ -203,8 +272,7 @@ function getDateTimeFormatOptionsFromFormatString(
 	for (const { groups } of format.matchAll(customDateTimeFormatParserRegex)) {
 		if (groups == null) continue;
 
-		for (const key in groups) {
-			const value = groups[key];
+		for (const [key, value] of Object.entries(groups)) {
 			if (value == null) continue;
 
 			switch (key) {
@@ -263,9 +331,10 @@ function getDateTimeFormatOptionsFromFormatString(
 				case 'dayPeriod':
 					options.dayPeriod = 'narrow';
 					options.hour12 = true;
+					options.hourCycle = 'h12';
 					break;
 				case 'timeZoneName':
-					options.timeZoneName = (value.length === 2 ? 'longOffset' : 'shortOffset') as any;
+					options.timeZoneName = value.length === 2 ? 'long' : 'short';
 					break;
 			}
 		}
@@ -274,8 +343,52 @@ function getDateTimeFormatOptionsFromFormatString(
 	return options;
 }
 
+export function getTimeRemaining(
+	expiresOn: string | undefined,
+	unit?: 'days' | 'hours' | 'minutes' | 'seconds',
+): number | undefined {
+	return expiresOn != null ? getDateDifference(Date.now(), new Date(expiresOn), unit, Math.round) : undefined;
+}
+
 const ordinals = ['th', 'st', 'nd', 'rd'];
 function formatWithOrdinal(n: number): string {
 	const v = n % 100;
 	return `${n}${ordinals[(v - 20) % 10] ?? ordinals[v] ?? ordinals[0]}`;
+}
+
+export function formatNumeric(
+	value: number,
+	style?: 'decimal' | 'currency' | 'percent' | 'unit' | null | undefined,
+	locale?: string,
+): string {
+	const format = getNumericFormat(style, locale);
+	return format(value);
+}
+
+export function getNumericFormat(
+	style?: 'decimal' | 'currency' | 'percent' | 'unit' | null | undefined,
+	locale?: string,
+): Intl.NumberFormat['format'] {
+	style ??= 'decimal';
+
+	const key = `${locale ?? ''}:${style}`;
+
+	let formatter = numberFormatCache.get(key);
+	if (formatter == null) {
+		const options: Intl.NumberFormatOptions = { localeMatcher: 'best fit', style: style };
+
+		let locales;
+		if (locale == null) {
+			locales = defaultLocales;
+		} else if (locale === 'system') {
+			locales = undefined;
+		} else {
+			locales = [locale];
+		}
+
+		formatter = new Intl.NumberFormat(locales, options);
+		numberFormatCache.set(key, formatter);
+	}
+
+	return formatter.format;
 }

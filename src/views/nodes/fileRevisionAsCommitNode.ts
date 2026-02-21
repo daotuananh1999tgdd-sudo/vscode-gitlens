@@ -1,31 +1,41 @@
-import {
-	Command,
-	MarkdownString,
-	Selection,
-	ThemeColor,
-	ThemeIcon,
-	TreeItem,
-	TreeItemCollapsibleState,
-	Uri,
-} from 'vscode';
-import type { DiffWithPreviousCommandArgs } from '../../commands';
-import { Colors, Commands } from '../../constants';
-import { CommitFormatter, StatusFileFormatter } from '../../git/formatters';
-import { GitUri } from '../../git/gitUri';
-import { GitBranch, GitCommit, GitFile, GitRevisionReference } from '../../git/models';
-import { joinPaths } from '../../system/path';
-import { FileHistoryView } from '../fileHistoryView';
-import { LineHistoryView } from '../lineHistoryView';
-import { ViewsWithCommits } from '../viewBase';
-import { MergeConflictCurrentChangesNode } from './mergeConflictCurrentChangesNode';
-import { MergeConflictIncomingChangesNode } from './mergeConflictIncomingChangesNode';
-import { ContextValues, ViewNode, ViewRefFileNode } from './viewNode';
+import type { CancellationToken, Command, Selection, Uri } from 'vscode';
+import { MarkdownString, ThemeColor, ThemeIcon, TreeItem, TreeItemCollapsibleState } from 'vscode';
+import type { DiffWithCommandArgs } from '../../commands/diffWith.js';
+import type { DiffWithPreviousCommandArgs } from '../../commands/diffWithPrevious.js';
+import type { Colors } from '../../constants.colors.js';
+import type { Container } from '../../container.js';
+import { CommitFormatter } from '../../git/formatters/commitFormatter.js';
+import { StatusFileFormatter } from '../../git/formatters/statusFormatter.js';
+import type { DiffRange } from '../../git/gitProvider.js';
+import { GitUri } from '../../git/gitUri.js';
+import type { GitBranch } from '../../git/models/branch.js';
+import type { GitCommit } from '../../git/models/commit.js';
+import type { GitFile } from '../../git/models/file.js';
+import type { GitRevisionReference } from '../../git/models/reference.js';
+import { getGitFileStatusIcon } from '../../git/utils/fileStatus.utils.js';
+import { createCommand } from '../../system/-webview/command.js';
+import { configuration } from '../../system/-webview/configuration.js';
+import { editorLineToDiffRange, selectionToDiffRange } from '../../system/-webview/vscode/editors.js';
+import { joinPaths } from '../../system/path.js';
+import { getSettledValue, pauseOnCancelOrTimeoutMapTuplePromise } from '../../system/promise.js';
+import type { FileHistoryView } from '../fileHistoryView.js';
+import type { LineHistoryView } from '../lineHistoryView.js';
+import type { ViewsWithCommits } from '../viewBase.js';
+import { createViewDecorationUri } from '../viewDecorationProvider.js';
+import type { ViewNode } from './abstract/viewNode.js';
+import { ContextValues } from './abstract/viewNode.js';
+import { ViewRefFileNode } from './abstract/viewRefNode.js';
+import { MergeConflictCurrentChangesNode } from './mergeConflictCurrentChangesNode.js';
+import { MergeConflictIncomingChangesNode } from './mergeConflictIncomingChangesNode.js';
 
-export class FileRevisionAsCommitNode extends ViewRefFileNode<ViewsWithCommits | FileHistoryView | LineHistoryView> {
+export class FileRevisionAsCommitNode extends ViewRefFileNode<
+	'file-commit',
+	ViewsWithCommits | FileHistoryView | LineHistoryView
+> {
 	constructor(
 		view: ViewsWithCommits | FileHistoryView | LineHistoryView,
 		parent: ViewNode,
-		public readonly file: GitFile,
+		file: GitFile,
 		public commit: GitCommit,
 		private readonly _options: {
 			branch?: GitBranch;
@@ -34,15 +44,11 @@ export class FileRevisionAsCommitNode extends ViewRefFileNode<ViewsWithCommits |
 			unpublished?: boolean;
 		} = {},
 	) {
-		super(GitUri.fromFile(file, commit.repoPath, commit.sha), view, parent);
+		super('file-commit', GitUri.fromFile(file, commit.repoPath, commit.sha), view, parent, file);
 	}
 
 	override toClipboard(): string {
 		return `${this.commit.shortSha}: ${this.commit.summary}`;
-	}
-
-	get fileName(): string {
-		return this.file.path;
 	}
 
 	get isTip(): boolean {
@@ -56,15 +62,14 @@ export class FileRevisionAsCommitNode extends ViewRefFileNode<ViewsWithCommits |
 	async getChildren(): Promise<ViewNode[]> {
 		if (!this.commit.file?.hasConflicts) return [];
 
-		const [mergeStatus, rebaseStatus] = await Promise.all([
-			this.view.container.git.getMergeStatus(this.commit.repoPath),
-			this.view.container.git.getRebaseStatus(this.commit.repoPath),
-		]);
-		if (mergeStatus == null && rebaseStatus == null) return [];
+		const pausedOpStatus = await this.view.container.git
+			.getRepositoryService(this.commit.repoPath)
+			.pausedOps?.getPausedOperationStatus?.();
+		if (pausedOpStatus == null) return [];
 
 		return [
-			new MergeConflictCurrentChangesNode(this.view, this, (mergeStatus ?? rebaseStatus)!, this.file),
-			new MergeConflictIncomingChangesNode(this.view, this, (mergeStatus ?? rebaseStatus)!, this.file),
+			new MergeConflictCurrentChangesNode(this.view, this, pausedOpStatus, this.file),
+			new MergeConflictIncomingChangesNode(this.view, this, pausedOpStatus, this.file),
 		];
 	}
 
@@ -73,10 +78,9 @@ export class FileRevisionAsCommitNode extends ViewRefFileNode<ViewsWithCommits |
 			// Try to get the commit directly from the multi-file commit
 			const commit = await this.commit.getCommitForFile(this.file);
 			if (commit == null) {
-				const log = await this.view.container.git.getLogForFile(this.repoPath, this.file.path, {
-					limit: 2,
-					ref: this.commit.sha,
-				});
+				const log = await this.view.container.git
+					.getRepositoryService(this.repoPath)
+					.commits.getLogForPath(this.file.path, this.commit.sha, { isFolder: false, limit: 1 });
 				if (log != null) {
 					this.commit = log.commits.get(this.commit.sha) ?? this.commit;
 				}
@@ -87,7 +91,7 @@ export class FileRevisionAsCommitNode extends ViewRefFileNode<ViewsWithCommits |
 
 		const item = new TreeItem(
 			CommitFormatter.fromTemplate(this.view.config.formats.commits.label, this.commit, {
-				dateFormat: this.view.container.config.defaultDateFormat,
+				dateFormat: configuration.get('defaultDateFormat'),
 				getBranchAndTagTips: (sha: string) => this._options.getBranchAndTagTips?.(sha, { compact: true }),
 				messageTruncateAtNewLine: true,
 			}),
@@ -97,21 +101,21 @@ export class FileRevisionAsCommitNode extends ViewRefFileNode<ViewsWithCommits |
 		item.contextValue = this.contextValue;
 
 		item.description = CommitFormatter.fromTemplate(this.view.config.formats.commits.description, this.commit, {
-			dateFormat: this.view.container.config.defaultDateFormat,
+			dateFormat: configuration.get('defaultDateFormat'),
 			getBranchAndTagTips: (sha: string) => this._options.getBranchAndTagTips?.(sha, { compact: true }),
 			messageTruncateAtNewLine: true,
 		});
 
-		item.resourceUri = Uri.parse(`gitlens-view://commit-file/status/${this.file.status}`);
+		item.resourceUri = createViewDecorationUri('commit-file', { status: this.file.status });
 
 		if (!this.commit.isUncommitted && this.view.config.avatars) {
 			item.iconPath = this._options.unpublished
-				? new ThemeIcon('arrow-up', new ThemeColor(Colors.UnpublishedCommitIconColor))
-				: await this.commit.getAvatarUri({ defaultStyle: this.view.container.config.defaultGravatarsStyle });
+				? new ThemeIcon('arrow-up', new ThemeColor('gitlens.unpublishedCommitIconColor' satisfies Colors))
+				: await this.commit.getAvatarUri({ defaultStyle: configuration.get('defaultGravatarsStyle') });
 		}
 
 		if (item.iconPath == null) {
-			const icon = GitFile.getStatusIcon(this.file.status);
+			const icon = getGitFileStatusIcon(this.file.status);
 			item.iconPath = {
 				dark: this.view.container.context.asAbsolutePath(joinPaths('images', 'dark', icon)),
 				light: this.view.container.context.asAbsolutePath(joinPaths('images', 'light', icon)),
@@ -124,124 +128,150 @@ export class FileRevisionAsCommitNode extends ViewRefFileNode<ViewsWithCommits |
 	}
 
 	protected get contextValue(): string {
+		const submodule = this.file.submodule != null ? '+submodule' : '';
 		if (!this.commit.isUncommitted) {
 			return `${ContextValues.File}+committed${this._options.branch?.current ? '+current' : ''}${
 				this.isTip ? '+HEAD' : ''
-			}${this._options.unpublished ? '+unpublished' : ''}`;
+			}${this._options.unpublished ? '+unpublished' : ''}${submodule}`;
 		}
 
 		return this.commit.file?.hasConflicts
-			? `${ContextValues.File}+conflicted`
+			? `${ContextValues.File}+conflicted${submodule}`
 			: this.commit.isUncommittedStaged
-			? `${ContextValues.File}+staged`
-			: `${ContextValues.File}+unstaged`;
+				? `${ContextValues.File}+staged${submodule}`
+				: `${ContextValues.File}+unstaged${submodule}`;
 	}
 
 	override getCommand(): Command | undefined {
-		let line;
+		let range: DiffRange;
 		if (this.commit.lines.length) {
-			line = this.commit.lines[0].line - 1;
+			// TODO@eamodio should the endLine be the last line of the commit?
+			range = { startLine: this.commit.lines[0].line, endLine: this.commit.lines[0].line };
 		} else {
-			line = this._options.selection?.active.line ?? 0;
+			range = this.commit.file?.range ?? selectionToDiffRange(this._options?.selection);
 		}
 
 		if (this.commit.file?.hasConflicts) {
-			return {
-				title: 'Open Changes',
-				command: Commands.DiffWith,
-				arguments: [
-					{
-						lhs: {
-							sha: 'MERGE_HEAD',
-							uri: GitUri.fromFile(this.file, this.repoPath, undefined, true),
-						},
-						rhs: {
-							sha: 'HEAD',
-							uri: GitUri.fromFile(this.file, this.repoPath),
-						},
-						repoPath: this.repoPath,
-						line: 0,
-						showOptions: {
-							preserveFocus: false,
-							preview: false,
-						},
-					},
-				],
-			};
+			return createCommand<[DiffWithCommandArgs]>('gitlens.diffWith', 'Open Changes', {
+				lhs: {
+					sha: 'MERGE_HEAD',
+					uri: GitUri.fromFile(this.file, this.repoPath, undefined, true),
+				},
+				rhs: {
+					sha: 'HEAD',
+					uri: GitUri.fromFile(this.file, this.repoPath),
+				},
+				repoPath: this.repoPath,
+				range: editorLineToDiffRange(0),
+				showOptions: { preserveFocus: false, preview: false },
+			});
 		}
 
-		const commandArgs: DiffWithPreviousCommandArgs = {
-			commit: this.commit,
-			uri: GitUri.fromFile(this.file, this.commit.repoPath),
-			line: line,
-			showOptions: {
-				preserveFocus: true,
-				preview: true,
+		return createCommand<[undefined, DiffWithPreviousCommandArgs]>(
+			'gitlens.diffWithPrevious:views',
+			'Open Changes with Previous Revision',
+			undefined,
+			{
+				commit: this.commit,
+				uri: GitUri.fromFile(this.file, this.commit.repoPath),
+				range: range,
+				showOptions: { preserveFocus: true, preview: true },
 			},
-		};
-		return {
-			title: 'Open Changes with Previous Revision',
-			command: Commands.DiffWithPrevious,
-			arguments: [undefined, commandArgs],
-		};
+		);
 	}
 
-	override async resolveTreeItem(item: TreeItem): Promise<TreeItem> {
-		if (item.tooltip == null) {
-			item.tooltip = await this.getTooltip();
-		}
+	override async resolveTreeItem(item: TreeItem, token: CancellationToken): Promise<TreeItem> {
+		item.tooltip ??= await this.getTooltip(token);
 		return item;
 	}
 
 	async getConflictBaseUri(): Promise<Uri | undefined> {
 		if (!this.commit.file?.hasConflicts) return undefined;
 
-		const mergeBase = await this.view.container.git.getMergeBase(this.repoPath, 'MERGE_HEAD', 'HEAD');
+		const mergeBase = await this.view.container.git
+			.getRepositoryService(this.repoPath)
+			.refs.getMergeBase('MERGE_HEAD', 'HEAD');
 		return GitUri.fromFile(this.file, this.repoPath, mergeBase ?? 'HEAD');
 	}
 
-	private async getTooltip() {
-		const remotes = await this.view.container.git.getRemotesWithProviders(this.commit.repoPath);
-		const remote = await this.view.container.git.getRichRemoteProvider(remotes);
-
-		if (this.commit.message == null) {
-			await this.commit.ensureFullDetails();
-		}
-
-		let autolinkedIssuesOrPullRequests;
-		let pr;
-
-		if (remote?.provider != null) {
-			[autolinkedIssuesOrPullRequests, pr] = await Promise.all([
-				this.view.container.autolinks.getIssueOrPullRequestLinks(
-					this.commit.message ?? this.commit.summary,
-					remote,
-				),
-				this.view.container.git.getPullRequestForCommit(this.commit.ref, remote.provider),
-			]);
-		}
-
-		const status = StatusFileFormatter.fromTemplate(`\${status}\${ (originalPath)}`, this.file);
-		const tooltip = await CommitFormatter.fromTemplateAsync(
-			`\${link}\${' via 'pullRequest} \u2022 ${status}\${ \u2022 changesDetail}\${'&nbsp;&nbsp;&nbsp;'tips}\n\n\${avatar} &nbsp;__\${author}__, \${ago} &nbsp; _(\${date})_ \n\n\${message}\${\n\n---\n\nfootnotes}`,
+	private async getTooltip(cancellation: CancellationToken) {
+		const tooltip = await getFileRevisionAsCommitTooltip(
+			this.view.container,
 			this.commit,
+			this.file,
+			this.view.config.formats.commits.tooltipWithStatus,
 			{
-				autolinkedIssuesOrPullRequests: autolinkedIssuesOrPullRequests,
-				dateFormat: this.view.container.config.defaultDateFormat,
 				getBranchAndTagTips: this._options.getBranchAndTagTips,
-				markdown: true,
-				messageAutolinks: true,
-				messageIndent: 4,
-				pullRequestOrRemote: pr,
-				remotes: remotes,
 				unpublished: this._options.unpublished,
+				cancellation: cancellation,
 			},
 		);
 
 		const markdown = new MarkdownString(tooltip, true);
 		markdown.supportHtml = true;
 		markdown.isTrusted = true;
-
 		return markdown;
 	}
+}
+
+export async function getFileRevisionAsCommitTooltip(
+	container: Container,
+	commit: GitCommit,
+	file: GitFile,
+	tooltipWithStatusFormat: string,
+	options?: {
+		cancellation?: CancellationToken;
+		getBranchAndTagTips?: (sha: string, options?: { compact?: boolean }) => string | undefined;
+		unpublished?: boolean;
+	},
+): Promise<string | undefined> {
+	const [remotesResult, _] = await Promise.allSettled([
+		container.git.getRepositoryService(commit.repoPath).remotes.getBestRemotesWithProviders(options?.cancellation),
+		commit.message == null ? commit.ensureFullDetails() : undefined,
+	]);
+
+	if (options?.cancellation?.isCancellationRequested) return undefined;
+
+	const remotes = getSettledValue(remotesResult, []);
+	const [remote] = remotes;
+
+	let enrichedAutolinks;
+	let pr;
+
+	if (remote?.supportsIntegration()) {
+		const [enrichedAutolinksResult, prResult] = await Promise.allSettled([
+			pauseOnCancelOrTimeoutMapTuplePromise(commit.getEnrichedAutolinks(remote), options?.cancellation),
+			commit.getAssociatedPullRequest(remote),
+		]);
+
+		const enrichedAutolinksMaybeResult = getSettledValue(enrichedAutolinksResult);
+		if (!enrichedAutolinksMaybeResult?.paused) {
+			enrichedAutolinks = enrichedAutolinksMaybeResult?.value;
+		}
+		pr = getSettledValue(prResult);
+	}
+
+	const status = StatusFileFormatter.fromTemplate(
+		`\${status}\${ (originalPath)}\${'&nbsp;&nbsp;•&nbsp;&nbsp;'changesDetail}`,
+		file,
+		{
+			outputFormat: 'markdown',
+		},
+	);
+	return CommitFormatter.fromTemplateAsync(
+		tooltipWithStatusFormat.replace('{{slot-status}}', status),
+		commit,
+		{ source: 'view:hover' },
+		{
+			enrichedAutolinks: enrichedAutolinks,
+			dateFormat: configuration.get('defaultDateFormat'),
+			getBranchAndTagTips: options?.getBranchAndTagTips,
+			messageAutolinks: true,
+			messageIndent: 4,
+			pullRequest: pr,
+			outputFormat: 'markdown',
+			remotes: remotes,
+			unpublished: options?.unpublished,
+		},
+	);
 }

@@ -1,125 +1,134 @@
 /*global*/
 import './home.scss';
-import { provideVSCodeDesignSystem, vsCodeButton, vsCodeDivider } from '@vscode/webview-ui-toolkit';
-import { Disposable } from 'vscode';
-import { getSubscriptionTimeRemaining, SubscriptionState } from '../../../subscription';
-import { DidChangeSubscriptionNotificationType, State } from '../../home/protocol';
-import { ExecuteCommandType, IpcMessage, onIpc } from '../../protocol';
-import { App } from '../shared/appBase';
-import { DOM } from '../shared/dom';
+import { provide } from '@lit/context';
+import { html } from 'lit';
+import { customElement, property, query, state } from 'lit/decorators.js';
+import { when } from 'lit/directives/when.js';
+import type { State } from '../../home/protocol.js';
+import { DidChangeSubscription, DidFocusAccount } from '../../home/protocol.js';
+import {
+	ActiveOverviewState,
+	activeOverviewStateContext,
+	InactiveOverviewState,
+	inactiveOverviewStateContext,
+} from '../plus/home/components/overviewState.js';
+import type { GlHomeHeader } from '../plus/shared/components/home-header.js';
+import { GlAppHost } from '../shared/appHost.js';
+import { scrollableBase } from '../shared/components/styles/lit/base.css.js';
+import type { LoggerContext } from '../shared/contexts/logger.js';
+import type { HostIpc } from '../shared/ipc.js';
+import type { ThemeChangeEvent } from '../shared/theme.js';
+import type { GlAiAllAccessBanner } from './components/ai-all-access-banner.js';
+import { homeBaseStyles, homeStyles } from './home.css.js';
+import { HomeStateProvider } from './stateProvider.js';
+import '../plus/shared/components/home-header.js';
+import '../plus/home/components/active-work.js';
+import '../plus/home/components/launchpad.js';
+import '../plus/home/components/overview.js';
+import './components/feature-nav.js';
+import './components/ai-all-access-banner.js';
+import './components/ama-banner.js';
+import './components/integration-banner.js';
+import './components/preview-banner.js';
+import './components/welcome-overlay.js';
+import '../shared/components/mcp-banner.js';
+import './components/repo-alerts.js';
+import '../shared/components/banner/banner.js';
 
-export class HomeApp extends App<State> {
-	private $slot1!: HTMLDivElement;
-	private $slot2!: HTMLDivElement;
+@customElement('gl-home-app')
+export class GlHomeApp extends GlAppHost<State> {
+	static override styles = [homeBaseStyles, scrollableBase, homeStyles];
 
-	constructor() {
-		super('HomeApp');
+	@provide({ context: activeOverviewStateContext })
+	private _activeOverviewState!: ActiveOverviewState;
+
+	@provide({ context: inactiveOverviewStateContext })
+	private _inactiveOverviewState!: InactiveOverviewState;
+
+	@query('gl-home-header')
+	private _header!: GlHomeHeader;
+
+	@query('gl-ai-all-access-banner')
+	private allAccessPromoBanner!: GlAiAllAccessBanner;
+
+	private badgeSource = { source: 'home', detail: 'badge' };
+
+	protected override createStateProvider(bootstrap: string, ipc: HostIpc, logger: LoggerContext): HomeStateProvider {
+		this.disposables.push((this._activeOverviewState = new ActiveOverviewState(ipc)));
+		this.disposables.push((this._inactiveOverviewState = new InactiveOverviewState(ipc)));
+
+		return new HomeStateProvider(this, bootstrap, ipc, logger);
 	}
 
-	protected override onInitialize() {
-		provideVSCodeDesignSystem().register({
-			register: function (container: any, context: any) {
-				vsCodeButton().register(container, context);
-				vsCodeDivider().register(container, context);
-			},
-		});
+	override connectedCallback(): void {
+		super.connectedCallback?.();
 
-		this.$slot1 = document.getElementById('slot1') as HTMLDivElement;
-		this.$slot2 = document.getElementById('slot2') as HTMLDivElement;
-
-		this.updateState();
-	}
-
-	protected override onBind(): Disposable[] {
-		const disposables = super.onBind?.() ?? [];
-
-		disposables.push(DOM.on('[data-action]', 'click', (e, target: HTMLElement) => this.onActionClicked(e, target)));
-
-		return disposables;
-	}
-
-	protected override onMessageReceived(e: MessageEvent) {
-		const msg = e.data as IpcMessage;
-
-		switch (msg.method) {
-			case DidChangeSubscriptionNotificationType.method:
-				this.log(`${this.appName}.onMessageReceived(${msg.id}): name=${msg.method}`);
-
-				onIpc(DidChangeSubscriptionNotificationType, msg, params => {
-					this.state = params;
-					this.updateState();
-				});
-				break;
-
-			default:
-				super.onMessageReceived?.(e);
-				break;
-		}
-	}
-
-	private onActionClicked(e: MouseEvent, target: HTMLElement) {
-		const action = target.dataset.action;
-		if (action?.startsWith('command:')) {
-			this.sendCommand(ExecuteCommandType, { command: action.slice(8) });
-		}
-	}
-
-	private updateState() {
-		const { subscription, welcomeVisible } = this.state;
-		if (subscription.account?.verified === false) {
-			DOM.insertTemplate('state:verify-email', this.$slot1);
-			DOM.insertTemplate(welcomeVisible ? 'welcome' : 'links', this.$slot2);
-
-			return;
-		}
-
-		const $container = document.getElementById('container') as HTMLDivElement;
-		$container.classList.toggle('welcome', welcomeVisible);
-
-		switch (subscription.state) {
-			case SubscriptionState.Free:
-				if (welcomeVisible) {
-					DOM.insertTemplate('welcome', this.$slot1);
-					DOM.insertTemplate('state:free', this.$slot2);
-				} else {
-					DOM.insertTemplate('state:free', this.$slot1);
-					DOM.insertTemplate('links', this.$slot2);
+		this.disposables.push(
+			this._ipc.onReceiveMessage(msg => {
+				switch (true) {
+					case DidFocusAccount.is(msg):
+						this._header.show();
+						break;
+					case DidChangeSubscription.is(msg):
+						this._header.refreshPromo();
+						this.refreshAiAllAccessPromo();
+						break;
 				}
-				break;
-			case SubscriptionState.FreeInPreview: {
-				const remaining = getSubscriptionTimeRemaining(subscription, 'days') ?? 0;
-				DOM.insertTemplate('state:free-preview', this.$slot1, {
-					bindings: {
-						previewDays: `${remaining === 1 ? `${remaining} more day` : `${remaining} more days`}`,
-					},
-				});
-				DOM.insertTemplate(welcomeVisible ? 'welcome' : 'links', this.$slot2);
-				break;
-			}
-			case SubscriptionState.FreePreviewExpired:
-				DOM.insertTemplate('state:free-preview-expired', this.$slot1);
-				DOM.insertTemplate(welcomeVisible ? 'welcome' : 'links', this.$slot2);
-				break;
-			case SubscriptionState.FreePlusInTrial: {
-				const remaining = getSubscriptionTimeRemaining(subscription, 'days') ?? 0;
-				DOM.insertTemplate('state:plus-trial', this.$slot1, {
-					bindings: {
-						trialDays: `${remaining === 1 ? `${remaining} day` : `${remaining} days`}`,
-					},
-				});
-				DOM.insertTemplate(welcomeVisible ? 'welcome' : 'links', this.$slot2);
-				break;
-			}
-			case SubscriptionState.FreePlusTrialExpired:
-				DOM.insertTemplate('state:plus-trial-expired', this.$slot1);
-				DOM.insertTemplate(welcomeVisible ? 'welcome' : 'links', this.$slot2);
-				break;
-			case SubscriptionState.Paid:
-				DOM.insertTemplate('state:paid', this.$slot1);
-				DOM.insertTemplate(welcomeVisible ? 'welcome' : 'links', this.$slot2);
-				break;
-		}
+			}),
+		);
+	}
+
+	@property({ type: String })
+	webroot?: string;
+
+	@state()
+	private isLightTheme = false;
+
+	protected override onThemeUpdated(e: ThemeChangeEvent): void {
+		this.isLightTheme = e.isLightTheme;
+	}
+
+	override render(): unknown {
+		return html`
+			<div class="home scrollable">
+				<gl-home-header class="home__header"></gl-home-header>
+				${when(!this.state?.previewEnabled, () => html`<gl-preview-banner></gl-preview-banner>`)}
+				${when(this.state?.amaBannerCollapsed === false, () => html`<gl-ama-banner></gl-ama-banner>`)}
+				<gl-repo-alerts class="home__alerts"></gl-repo-alerts>
+				<main class="home__main scrollable" id="main">
+					${when(
+						this.state?.previewEnabled === true,
+						() => html`
+							<gl-preview-banner></gl-preview-banner>
+							<gl-ai-all-access-banner></gl-ai-all-access-banner>
+							<gl-mcp-banner
+								.layout=${'responsive'}
+								.source=${'home'}
+								.canAutoRegister=${this.state?.mcpCanAutoRegister ?? false}
+								.collapsed=${this.state?.mcpBannerCollapsed ?? true}
+							></gl-mcp-banner>
+							<gl-active-work></gl-active-work>
+							<gl-launchpad></gl-launchpad>
+							<gl-overview></gl-overview>
+						`,
+						() => html`
+							<gl-ai-all-access-banner></gl-ai-all-access-banner>
+							<gl-mcp-banner
+								.layout=${'responsive'}
+								.source=${'home'}
+								.canAutoRegister=${this.state?.mcpCanAutoRegister ?? false}
+								.collapsed=${this.state?.mcpBannerCollapsed ?? true}
+							></gl-mcp-banner>
+							<gl-feature-nav .badgeSource=${this.badgeSource}></gl-feature-nav>
+						`,
+					)}
+				</main>
+				<gl-welcome-overlay .isLightTheme=${this.isLightTheme} .webroot=${this.webroot}></gl-welcome-overlay>
+			</div>
+		`;
+	}
+
+	refreshAiAllAccessPromo(): void {
+		this.allAccessPromoBanner?.requestUpdate();
 	}
 }
-
-new HomeApp();

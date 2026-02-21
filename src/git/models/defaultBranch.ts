@@ -1,6 +1,6 @@
-import { RemoteProviderReference } from './remoteProvider';
+import type { ProviderReference } from './remoteProvider.js';
 
 export interface DefaultBranch {
-	provider: RemoteProviderReference;
+	provider: ProviderReference;
 	name: string;
 }

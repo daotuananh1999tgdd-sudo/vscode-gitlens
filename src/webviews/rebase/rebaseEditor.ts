@@ -1,637 +1,185 @@
-import {
+import type {
 	CancellationToken,
-	ConfigurationTarget,
+	ConfigurationChangeEvent,
 	CustomTextEditorProvider,
-	Disposable,
-	Position,
-	Range,
 	TextDocument,
-	Uri,
 	WebviewPanel,
-	window,
-	workspace,
-	WorkspaceEdit,
 } from 'vscode';
-import { getNonce } from '@env/crypto';
-import { ShowQuickCommitCommand } from '../../commands';
-import { configuration } from '../../configuration';
-import { CoreCommands } from '../../constants';
-import type { Container } from '../../container';
-import { RepositoryChange, RepositoryChangeComparisonMode } from '../../git/models';
-import { Logger } from '../../logger';
-import { Messages } from '../../messages';
-import { executeCoreCommand } from '../../system/command';
-import { gate } from '../../system/decorators/gate';
-import { debug } from '../../system/decorators/log';
-import { join, map } from '../../system/iterable';
-import { normalizePath } from '../../system/path';
-import { IpcMessage, onIpc } from '../protocol';
+import { Disposable, Uri, ViewColumn, window } from 'vscode';
+import { uuid } from '@env/crypto.js';
+import type { Container } from '../../container.js';
 import {
-	AbortCommandType,
-	Author,
-	ChangeEntryCommandType,
-	Commit,
-	DidChangeNotificationType,
-	DisableCommandType,
-	MoveEntryCommandType,
-	RebaseEntry,
-	RebaseEntryAction,
-	StartCommandType,
-	State,
-	SwitchCommandType,
-} from './protocol';
+	getRepoUriFromRebaseTodo,
+	isRebaseTodoEditorEnabled,
+	openRebaseEditor,
+	reopenRebaseTodoEditor,
+	setRebaseTodoEditorEnablement,
+} from '../../git/utils/-webview/rebase.utils.js';
+import { configuration } from '../../system/-webview/configuration.js';
+import { setContext } from '../../system/-webview/context.js';
+import { debug, trace } from '../../system/decorators/log.js';
+import { getScopedLogger } from '../../system/logger.scope.js';
+import type { WebviewCommandRegistrar } from '../webviewCommandRegistrar.js';
+import { WebviewController } from '../webviewController.js';
+import type { CustomEditorDescriptor } from '../webviewDescriptors.js';
+import type { State } from './protocol.js';
 
-let ipcSequence = 0;
-function nextIpcId() {
-	if (ipcSequence === Number.MAX_SAFE_INTEGER) {
-		ipcSequence = 1;
-	} else {
-		ipcSequence++;
-	}
-
-	return `host:${ipcSequence}`;
-}
-
-let webviewId = 0;
-function nextWebviewId() {
-	if (webviewId === Number.MAX_SAFE_INTEGER) {
-		webviewId = 1;
-	} else {
-		webviewId++;
-	}
-
-	return webviewId;
-}
-
-const rebaseRegex = /^\s?#\s?Rebase\s([0-9a-f]+)(?:..([0-9a-f]+))?\sonto\s([0-9a-f]+)\s.*$/im;
-const rebaseCommandsRegex = /^\s?(p|pick|r|reword|e|edit|s|squash|f|fixup|d|drop)\s([0-9a-f]+?)\s(.*)$/gm;
-
-const rebaseActionsMap = new Map<string, RebaseEntryAction>([
-	['p', 'pick'],
-	['pick', 'pick'],
-	['r', 'reword'],
-	['reword', 'reword'],
-	['e', 'edit'],
-	['edit', 'edit'],
-	['s', 'squash'],
-	['squash', 'squash'],
-	['f', 'fixup'],
-	['fixup', 'fixup'],
-	['d', 'drop'],
-	['drop', 'drop'],
-]);
-
-interface RebaseEditorContext {
-	dispose(): void;
-
-	readonly id: number;
-	readonly document: TextDocument;
-	readonly panel: WebviewPanel;
-	readonly repoPath: string;
-	readonly subscriptions: Disposable[];
-
-	abortOnClose: boolean;
-	pendingChange?: boolean;
-}
+const descriptor: CustomEditorDescriptor = {
+	id: 'gitlens.rebase',
+	fileName: 'rebase.html',
+	iconPath: 'images/gitlens-icon.png',
+	title: 'Interactive Rebase',
+	contextKeyPrefix: 'gitlens:webview:rebase',
+	trackingFeature: 'rebaseEditor',
+	type: 'rebase',
+	plusFeature: false,
+	webviewOptions: { enableCommandUris: true, enableScripts: true },
+	webviewHostOptions: { enableFindWidget: true, retainContextWhenHidden: true },
+};
 
 export class RebaseEditorProvider implements CustomTextEditorProvider, Disposable {
+	private readonly _controllers = new Map<string, WebviewController<'gitlens.rebase', State>>();
 	private readonly _disposable: Disposable;
 
-	constructor(private readonly container: Container) {
+	constructor(
+		private readonly container: Container,
+		private readonly commandRegistrar: WebviewCommandRegistrar,
+	) {
 		this._disposable = Disposable.from(
 			window.registerCustomEditorProvider('gitlens.rebase', this, {
 				supportsMultipleEditorsPerDocument: false,
-				webviewOptions: {
-					retainContextWhenHidden: true,
-				},
+				webviewOptions: descriptor.webviewHostOptions,
+			}),
+			configuration.onDidChangeAny(this.onAnyConfigurationChanged, this),
+			container.git.onDidChangeRepository(e => {
+				if (e.changed('rebase')) {
+					void this.onRebaseChanged(e.repository.path);
+				}
 			}),
 		);
+		void setContext('gitlens:rebase:editor:enabled', this.enabled);
 	}
 
-	dispose() {
+	dispose(): void {
+		this._controllers.forEach(c => c.dispose());
+		this._controllers.clear();
 		this._disposable.dispose();
 	}
 
 	get enabled(): boolean {
-		const associations = configuration.inspectAny<
-			{ [key: string]: string } | { viewType: string; filenamePattern: string }[]
-		>('workbench.editorAssociations')?.globalValue;
-		if (associations == null || associations.length === 0) return true;
-
-		if (Array.isArray(associations)) {
-			const association = associations.find(a => a.filenamePattern === 'git-rebase-todo');
-			return association != null ? association.viewType === 'gitlens.rebase' : true;
-		}
-
-		const association = associations['git-rebase-todo'];
-		return association != null ? association === 'gitlens.rebase' : true;
-	}
-
-	private _disableAfterNextUse: boolean = false;
-	async enableForNextUse() {
-		if (!this.enabled) {
-			await this.setEnabled(true);
-			this._disableAfterNextUse = true;
-		}
+		return isRebaseTodoEditorEnabled();
 	}
 
 	async setEnabled(enabled: boolean): Promise<void> {
-		this._disableAfterNextUse = false;
-
-		const inspection = configuration.inspectAny<
-			{ [key: string]: string } | { viewType: string; filenamePattern: string }[]
-		>('workbench.editorAssociations');
-
-		let associations = inspection?.globalValue;
-		if (Array.isArray(associations)) {
-			associations = associations.reduce((accumulator, current) => {
-				accumulator[current.filenamePattern] = current.viewType;
-				return accumulator;
-			}, Object.create(null) as Record<string, string>);
+		// Only attempt to reopen if a rebase todo file is the active tab
+		if (this.isRebaseTodoActive()) {
+			void reopenRebaseTodoEditor(enabled ? 'gitlens.rebase' : 'default');
 		}
 
-		if (associations == null) {
-			if (enabled) return;
-
-			associations = {
-				'git-rebase-todo': 'default',
-			};
-		} else {
-			associations['git-rebase-todo'] = enabled ? 'gitlens.rebase' : 'default';
-		}
-
-		await configuration.updateAny('workbench.editorAssociations', associations, ConfigurationTarget.Global);
+		void setContext('gitlens:rebase:editor:enabled', enabled);
+		await setRebaseTodoEditorEnablement(enabled);
 	}
 
-	@debug({ args: false })
-	async resolveCustomTextEditor(document: TextDocument, panel: WebviewPanel, _token: CancellationToken) {
-		const repoPath = normalizePath(Uri.joinPath(document.uri, '..', '..', '..').fsPath);
-		const repo = this.container.git.getRepository(repoPath);
+	refresh(uri: Uri): void {
+		const controller = this._controllers.get(uri.toString());
+		void controller?.refresh(true);
+	}
 
-		const subscriptions: Disposable[] = [];
-		const context: RebaseEditorContext = {
-			dispose: () => Disposable.from(...subscriptions).dispose(),
+	private isRebaseTodoActive(): boolean {
+		const activeTab = window.tabGroups.activeTabGroup.activeTab;
+		if (activeTab == null) return false;
 
-			id: nextWebviewId(),
-			subscriptions: subscriptions,
-			document: document,
-			panel: panel,
-			repoPath: repo?.path ?? repoPath,
-			abortOnClose: true,
+		const input = activeTab.input;
+		if (input != null && typeof input === 'object' && 'uri' in input) {
+			const uri = input.uri;
+			if (uri instanceof Uri && uri.path.endsWith('git-rebase-todo')) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private onAnyConfigurationChanged(e: ConfigurationChangeEvent) {
+		if (!configuration.changedCore(e, 'workbench.editorAssociations')) return;
+
+		void setContext('gitlens:rebase:editor:enabled', this.enabled);
+	}
+
+	@debug()
+	private async onRebaseChanged(repoPath: string): Promise<void> {
+		const openOnPausedRebase = configuration.get('rebaseEditor.openOnPausedRebase');
+		if (!openOnPausedRebase || !isRebaseTodoEditorEnabled()) return;
+
+		// Only open if the rebase is actually paused (waiting for user action), not just running
+		const status = await this.container.git.getRepositoryService(repoPath).pausedOps?.getPausedOperationStatus?.();
+		if (status?.type === 'rebase' && status.isPaused) {
+			if (openOnPausedRebase === 'interactive' && !status.isInteractive) return;
+
+			// Open beside the current editor (e.g., commit message editor) during active rebase
+			await openRebaseEditor(this.container, repoPath, { viewColumn: ViewColumn.Beside });
+		}
+	}
+
+	@trace({ args: document => ({ document: document }) })
+	async resolveCustomTextEditor(
+		document: TextDocument,
+		panel: WebviewPanel,
+		_token: CancellationToken,
+	): Promise<void> {
+		const scope = getScopedLogger();
+
+		void this.container.usage.track(`${descriptor.trackingFeature}:shown`).catch();
+
+		const key = document.uri.toString();
+
+		// Dispose any existing controller for this document, (shouldn't happen due to supportsMultipleEditorsPerDocument being false)
+		const existing = this._controllers.get(key);
+		if (existing != null) {
+			scope?.trace(`Disposing existing rebase editor controller for ${key}:${existing.instanceId}`);
+			existing.dispose();
+			this._controllers.delete(key);
+		}
+
+		const repoUri = await getRepoUriFromRebaseTodo(document.uri);
+		const svc = this.container.git.getRepositoryService(repoUri);
+		const branch = await svc.branches.getBranch();
+
+		// Set panel title and icon
+		panel.title = `${descriptor.title}${branch?.name ? ` (${branch.name})` : ''}`;
+		panel.iconPath = Uri.file(this.container.context.asAbsolutePath(descriptor.iconPath));
+
+		panel.webview.options = {
+			enableCommandUris: true,
+			enableScripts: true,
+			localResourceRoots: [Uri.file(this.container.context.extensionPath)],
+			...descriptor.webviewOptions,
 		};
 
-		subscriptions.push(
-			panel.onDidDispose(() => {
-				// If the user closed this without taking an action, consider it an abort
-				if (context.abortOnClose) {
-					void this.abort(context);
-				}
+		const controller = await WebviewController.create<'gitlens.rebase', State>(
+			this.container,
+			this.commandRegistrar,
+			descriptor,
+			uuid(),
+			panel,
+			async (container, host) => {
+				const { RebaseWebviewProvider } = await import(
+					/* webpackChunkName: "webview-rebase" */ './rebaseWebviewProvider.js'
+				);
+				return new RebaseWebviewProvider(container, host, document, svc.path);
+			},
+		);
+		this._controllers.set(key, controller);
+
+		const subscriptions: Disposable[] = [
+			controller.onDidDispose(() => {
+				scope?.trace(`Disposing rebase editor controller (${key}:${controller.instanceId})`);
+
+				this._controllers.delete(key);
 				Disposable.from(...subscriptions).dispose();
 			}),
-			panel.onDidChangeViewState(() => {
-				if (!context.pendingChange) return;
+			controller,
+		];
 
-				void this.getStateAndNotify(context);
-			}),
-			panel.webview.onDidReceiveMessage(e => this.onMessageReceived(context, e)),
-			workspace.onDidChangeTextDocument(e => {
-				if (e.contentChanges.length === 0 || e.document.uri.toString() !== document.uri.toString()) return;
-
-				void this.getStateAndNotify(context);
-			}),
-			workspace.onDidSaveTextDocument(e => {
-				if (e.uri.toString() !== document.uri.toString()) return;
-
-				void this.getStateAndNotify(context);
-			}),
-		);
-
-		if (repo != null) {
-			subscriptions.push(
-				repo.onDidChange(e => {
-					if (!e.changed(RepositoryChange.Rebase, RepositoryChangeComparisonMode.Any)) return;
-
-					void this.getStateAndNotify(context);
-				}),
-			);
-		}
-
-		panel.webview.options = { enableCommandUris: true, enableScripts: true };
-		panel.webview.html = await this.getHtml(context);
-
-		if (this._disableAfterNextUse) {
-			this._disableAfterNextUse = false;
-			void this.setEnabled(false);
-		}
+		await controller.show(true, { preserveFocus: false }).catch();
 	}
-
-	@gate((context: RebaseEditorContext) => `${context.id}`)
-	private async getStateAndNotify(context: RebaseEditorContext) {
-		if (!context.panel.visible) {
-			context.pendingChange = true;
-
-			return;
-		}
-
-		const state = await this.parseState(context);
-		void this.postMessage(context, {
-			id: nextIpcId(),
-			method: DidChangeNotificationType.method,
-			params: { state: state },
-		});
-	}
-
-	private async parseState(context: RebaseEditorContext): Promise<State> {
-		const branch = await this.container.git.getBranch(context.repoPath);
-		const state = await parseRebaseTodo(this.container, context.document.getText(), context.repoPath, branch?.name);
-		return state;
-	}
-
-	private async postMessage(context: RebaseEditorContext, message: IpcMessage) {
-		try {
-			const success = await context.panel.webview.postMessage(message);
-			context.pendingChange = !success;
-			return success;
-		} catch (ex) {
-			Logger.error(ex);
-
-			context.pendingChange = true;
-			return false;
-		}
-	}
-
-	private onMessageReceived(context: RebaseEditorContext, e: IpcMessage) {
-		switch (e.method) {
-			// case ReadyCommandType.method:
-			// 	onIpcCommand(ReadyCommandType, e, params => {
-			// 		this.parseDocumentAndSendChange(panel, document);
-			// 	});
-
-			// 	break;
-
-			case AbortCommandType.method:
-				onIpc(AbortCommandType, e, () => this.abort(context));
-
-				break;
-
-			case DisableCommandType.method:
-				onIpc(DisableCommandType, e, () => this.disable(context));
-				break;
-
-			case StartCommandType.method:
-				onIpc(StartCommandType, e, () => this.rebase(context));
-				break;
-
-			case SwitchCommandType.method:
-				onIpc(SwitchCommandType, e, () => this.switch(context));
-				break;
-
-			case ChangeEntryCommandType.method:
-				onIpc(ChangeEntryCommandType, e, async params => {
-					const entries = parseRebaseTodoEntries(context.document);
-
-					const entry = entries.find(e => e.ref === params.ref);
-					if (entry == null) return;
-
-					const start = context.document.positionAt(entry.index);
-					const range = context.document.validateRange(
-						new Range(new Position(start.line, 0), new Position(start.line, Number.MAX_SAFE_INTEGER)),
-					);
-
-					let action = params.action;
-					const edit = new WorkspaceEdit();
-
-					// Fake the new set of entries, to check if last entry is a squash/fixup
-					const newEntries = [...entries];
-					newEntries.splice(entries.indexOf(entry), 1, {
-						...entry,
-						action: params.action,
-					});
-
-					let squashing = false;
-
-					for (const entry of newEntries) {
-						if (entry.action === 'squash' || entry.action === 'fixup') {
-							squashing = true;
-						} else if (squashing) {
-							if (entry.action !== 'drop') {
-								squashing = false;
-							}
-						}
-					}
-
-					// Ensure that the last entry isn't a squash/fixup
-					if (squashing) {
-						const lastEntry = newEntries[newEntries.length - 1];
-						if (entry.ref === lastEntry.ref) {
-							action = 'pick';
-						} else {
-							const start = context.document.positionAt(lastEntry.index);
-							const range = context.document.validateRange(
-								new Range(
-									new Position(start.line, 0),
-									new Position(start.line, Number.MAX_SAFE_INTEGER),
-								),
-							);
-
-							edit.replace(context.document.uri, range, `pick ${lastEntry.ref} ${lastEntry.message}`);
-						}
-					}
-
-					edit.replace(context.document.uri, range, `${action} ${entry.ref} ${entry.message}`);
-					await workspace.applyEdit(edit);
-				});
-
-				break;
-
-			case MoveEntryCommandType.method:
-				onIpc(MoveEntryCommandType, e, async params => {
-					const entries = parseRebaseTodoEntries(context.document);
-
-					const entry = entries.find(e => e.ref === params.ref);
-					if (entry == null) return;
-
-					const index = entries.findIndex(e => e.ref === params.ref);
-
-					let newIndex;
-					if (params.relative) {
-						if ((params.to === -1 && index === 0) || (params.to === 1 && index === entries.length - 1)) {
-							return;
-						}
-
-						newIndex = index + params.to;
-					} else {
-						if (index === params.to) return;
-
-						newIndex = params.to;
-					}
-
-					const newEntry = entries[newIndex];
-					let newLine = context.document.positionAt(newEntry.index).line;
-					if (newIndex < index) {
-						newLine++;
-					}
-
-					const start = context.document.positionAt(entry.index);
-					const range = context.document.validateRange(
-						new Range(new Position(start.line, 0), new Position(start.line + 1, 0)),
-					);
-
-					// Fake the new set of entries, so we can ensure that the last entry isn't a squash/fixup
-					const newEntries = [...entries];
-					newEntries.splice(index, 1);
-					newEntries.splice(newIndex, 0, entry);
-
-					let squashing = false;
-
-					for (const entry of newEntries) {
-						if (entry.action === 'squash' || entry.action === 'fixup') {
-							squashing = true;
-						} else if (squashing) {
-							if (entry.action !== 'drop') {
-								squashing = false;
-							}
-						}
-					}
-
-					const edit = new WorkspaceEdit();
-
-					let action = entry.action;
-
-					// Ensure that the last entry isn't a squash/fixup
-					if (squashing) {
-						const lastEntry = newEntries[newEntries.length - 1];
-						if (entry.ref === lastEntry.ref) {
-							action = 'pick';
-						} else {
-							const start = context.document.positionAt(lastEntry.index);
-							const range = context.document.validateRange(
-								new Range(
-									new Position(start.line, 0),
-									new Position(start.line, Number.MAX_SAFE_INTEGER),
-								),
-							);
-
-							edit.replace(context.document.uri, range, `pick ${lastEntry.ref} ${lastEntry.message}`);
-						}
-					}
-
-					edit.delete(context.document.uri, range);
-					edit.insert(
-						context.document.uri,
-						new Position(newLine, 0),
-						`${action} ${entry.ref} ${entry.message}\n`,
-					);
-
-					await workspace.applyEdit(edit);
-				});
-
-				break;
-		}
-	}
-
-	private async abort(context: RebaseEditorContext) {
-		context.abortOnClose = false;
-
-		// Avoid triggering events by disposing them first
-		context.dispose();
-
-		// Delete the contents to abort the rebase
-		const edit = new WorkspaceEdit();
-		edit.replace(context.document.uri, new Range(0, 0, context.document.lineCount, 0), '');
-		await workspace.applyEdit(edit);
-		await context.document.save();
-
-		context.panel.dispose();
-	}
-
-	private async disable(context: RebaseEditorContext) {
-		await this.abort(context);
-		await this.setEnabled(false);
-	}
-
-	private async rebase(context: RebaseEditorContext) {
-		context.abortOnClose = false;
-
-		// Avoid triggering events by disposing them first
-		context.dispose();
-
-		await context.document.save();
-
-		context.panel.dispose();
-	}
-
-	private switch(context: RebaseEditorContext) {
-		context.abortOnClose = false;
-
-		void Messages.showRebaseSwitchToTextWarningMessage();
-
-		// Open the text version of the document
-		void executeCoreCommand(CoreCommands.Open, context.document.uri, {
-			override: false,
-			preview: false,
-		});
-	}
-
-	private async getHtml(context: RebaseEditorContext): Promise<string> {
-		const webRootUri = Uri.joinPath(this.container.context.extensionUri, 'dist', 'webviews');
-		const uri = Uri.joinPath(webRootUri, 'rebase.html');
-		const content = new TextDecoder('utf8').decode(await workspace.fs.readFile(uri));
-
-		const bootstrap = await this.parseState(context);
-		const cspSource = context.panel.webview.cspSource;
-		const cspNonce = getNonce();
-
-		const root = context.panel.webview.asWebviewUri(this.container.context.extensionUri).toString();
-		const webRoot = context.panel.webview.asWebviewUri(webRootUri).toString();
-
-		const html = content
-			.replace(/#{(head|body|endOfBody)}/i, (_substring, token) => {
-				switch (token) {
-					case 'endOfBody':
-						return `<script type="text/javascript" nonce="#{cspNonce}">window.bootstrap = ${JSON.stringify(
-							bootstrap,
-						)};</script>`;
-					default:
-						return '';
-				}
-			})
-			.replace(/#{(cspSource|cspNonce|root|webroot)}/g, (substring, token) => {
-				switch (token) {
-					case 'cspSource':
-						return cspSource;
-					case 'cspNonce':
-						return cspNonce;
-					case 'root':
-						return root;
-					case 'webroot':
-						return webRoot;
-					default:
-						return '';
-				}
-			});
-
-		return html;
-	}
-}
-
-async function parseRebaseTodo(
-	container: Container,
-	contents: string | { entries: RebaseEntry[]; onto: string },
-	repoPath: string,
-	branch: string | undefined,
-): Promise<Omit<State, 'rebasing'>> {
-	let onto: string;
-	let entries;
-	if (typeof contents === 'string') {
-		entries = parseRebaseTodoEntries(contents);
-		[, , , onto] = rebaseRegex.exec(contents) ?? ['', '', ''];
-	} else {
-		({ entries, onto } = contents);
-	}
-
-	const authors = new Map<string, Author>();
-	const commits: Commit[] = [];
-
-	const log = await container.git.getLogForSearch(repoPath, {
-		pattern: `${onto ? `#:${onto} ` : ''}${join(
-			map(entries, e => `#:${e.ref}`),
-			' ',
-		)}`,
-	});
-	const foundCommits = log != null ? [...log.commits.values()] : [];
-
-	const ontoCommit = onto ? foundCommits.find(c => c.ref.startsWith(onto)) : undefined;
-	if (ontoCommit != null) {
-		const { name, email } = ontoCommit.author;
-		if (!authors.has(name)) {
-			authors.set(name, {
-				author: name,
-				avatarUrl: (
-					await ontoCommit.getAvatarUri({ defaultStyle: container.config.defaultGravatarsStyle })
-				).toString(true),
-				email: email,
-			});
-		}
-
-		commits.push({
-			ref: ontoCommit.ref,
-			author: name,
-			date: ontoCommit.formatDate(container.config.defaultDateFormat),
-			dateFromNow: ontoCommit.formatDateFromNow(),
-			message: ontoCommit.message || 'root',
-		});
-	}
-
-	for (const entry of entries) {
-		const commit = foundCommits.find(c => c.ref.startsWith(entry.ref));
-		if (commit == null) continue;
-
-		// If the onto commit is contained in the list of commits, remove it and clear the 'onto' value — See #1201
-		if (commit.ref === ontoCommit?.ref) {
-			commits.splice(0, 1);
-			onto = '';
-		}
-
-		const { name, email } = commit.author;
-		if (!authors.has(name)) {
-			authors.set(name, {
-				author: name,
-				avatarUrl: (
-					await commit.getAvatarUri({ defaultStyle: container.config.defaultGravatarsStyle })
-				).toString(true),
-				email: email,
-			});
-		}
-
-		commits.push({
-			ref: commit.ref,
-			author: name,
-			date: commit.formatDate(container.config.defaultDateFormat),
-			dateFromNow: commit.formatDateFromNow(),
-			message: commit.message ?? commit.summary,
-		});
-	}
-
-	return {
-		branch: branch ?? '',
-		onto: onto,
-		entries: entries,
-		authors: [...authors.values()],
-		commits: commits,
-		commands: {
-			commit: ShowQuickCommitCommand.getMarkdownCommandArgs(`\${commit}`, repoPath),
-		},
-	};
-}
-
-function parseRebaseTodoEntries(contents: string): RebaseEntry[];
-function parseRebaseTodoEntries(document: TextDocument): RebaseEntry[];
-function parseRebaseTodoEntries(contentsOrDocument: string | TextDocument): RebaseEntry[] {
-	const contents = typeof contentsOrDocument === 'string' ? contentsOrDocument : contentsOrDocument.getText();
-
-	const entries: RebaseEntry[] = [];
-
-	let match;
-	let action;
-	let ref;
-	let message;
-
-	do {
-		match = rebaseCommandsRegex.exec(contents);
-		if (match == null) break;
-
-		[, action, ref, message] = match;
-
-		entries.push({
-			index: match.index,
-			action: rebaseActionsMap.get(action) ?? 'pick',
-			// Stops excessive memory usage -- https://bugs.chromium.org/p/v8/issues/detail?id=2869
-			ref: ` ${ref}`.substr(1),
-			// Stops excessive memory usage -- https://bugs.chromium.org/p/v8/issues/detail?id=2869
-			message: message == null || message.length === 0 ? '' : ` ${message}`.substr(1),
-		});
-	} while (true);
-
-	return entries.reverse();
 }

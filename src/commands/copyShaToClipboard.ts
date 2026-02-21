@@ -1,37 +1,51 @@
-import { env, TextEditor, Uri } from 'vscode';
-import { Commands } from '../constants';
-import type { Container } from '../container';
-import { GitUri } from '../git/gitUri';
-import { Logger } from '../logger';
-import { Messages } from '../messages';
-import { command } from '../system/command';
-import { first } from '../system/iterable';
+import type { TextEditor, Uri } from 'vscode';
+import { env } from 'vscode';
+import type { Source } from '../constants.telemetry.js';
+import type { Container } from '../container.js';
+import { GitUri } from '../git/gitUri.js';
+import { shortenRevision } from '../git/utils/revision.utils.js';
+import { showGenericErrorMessage } from '../messages.js';
+import { command } from '../system/-webview/command.js';
+import { configuration } from '../system/-webview/configuration.js';
+import { createMarkdownCommandLink } from '../system/commands.js';
+import { first } from '../system/iterable.js';
+import { Logger } from '../system/logger.js';
+import { ActiveEditorCommand } from './commandBase.js';
+import { getCommandUri } from './commandBase.utils.js';
+import type { CommandContext } from './commandContext.js';
 import {
-	ActiveEditorCommand,
-	CommandContext,
-	getCommandUri,
 	isCommandContextViewNodeHasBranch,
 	isCommandContextViewNodeHasCommit,
 	isCommandContextViewNodeHasTag,
-} from './base';
+} from './commandContext.utils.js';
 
 export interface CopyShaToClipboardCommandArgs {
 	sha?: string;
+	source?: Source;
 }
 
 @command()
 export class CopyShaToClipboardCommand extends ActiveEditorCommand {
-	constructor(private readonly container: Container) {
-		super(Commands.CopyShaToClipboard);
+	static createMarkdownCommandLink(sha: string, source: Source): string;
+	static createMarkdownCommandLink(args: CopyShaToClipboardCommandArgs): string;
+	static createMarkdownCommandLink(argsOrSha: CopyShaToClipboardCommandArgs | string, source?: Source): string {
+		const args = typeof argsOrSha === 'string' ? { sha: argsOrSha, source: source } : argsOrSha;
+		return createMarkdownCommandLink<CopyShaToClipboardCommandArgs>('gitlens.copyShaToClipboard', args);
 	}
 
-	protected override preExecute(context: CommandContext, args?: CopyShaToClipboardCommandArgs) {
+	constructor(private readonly container: Container) {
+		super('gitlens.copyShaToClipboard');
+	}
+
+	protected override preExecute(context: CommandContext, args?: CopyShaToClipboardCommandArgs): Promise<void> {
 		if (isCommandContextViewNodeHasCommit(context)) {
 			args = { ...args };
-			args.sha = this.container.config.advanced.abbreviateShaOnCopy
-				? context.node.commit.shortSha
-				: context.node.commit.sha;
-			return this.execute(context.editor, context.node.commit.file?.uri, args);
+			args.sha = context.node.commit.sha;
+			return this.execute(
+				context.editor,
+				context.node.commit.file?.uri ?? context.node.commit.getRepository()?.uri,
+				args,
+			);
 		} else if (isCommandContextViewNodeHasBranch(context)) {
 			args = { ...args };
 			args.sha = context.node.branch.sha;
@@ -45,42 +59,47 @@ export class CopyShaToClipboardCommand extends ActiveEditorCommand {
 		return this.execute(context.editor, context.uri, args);
 	}
 
-	async execute(editor?: TextEditor, uri?: Uri, args?: CopyShaToClipboardCommandArgs) {
+	async execute(editor?: TextEditor, uri?: Uri, args?: CopyShaToClipboardCommandArgs): Promise<void> {
 		uri = getCommandUri(uri, editor);
 		args = { ...args };
 
 		try {
-			// If we don't have an editor then get the sha of the last commit to the branch
-			if (uri == null) {
-				const repoPath = this.container.git.getBestRepository(editor)?.path;
-				if (!repoPath) return;
+			if (!args.sha) {
+				// If we don't have an editor then get the sha of the last commit to the branch
+				if (uri == null) {
+					const repo = this.container.git.getBestRepository(editor);
+					if (repo == null) return;
 
-				const log = await this.container.git.getLog(repoPath, { limit: 1 });
-				if (log == null) return;
+					const log = await repo.git.commits.getLog(undefined, { limit: 1 });
+					if (log == null) return;
 
-				args.sha = first(log.commits.values()).sha;
-			} else if (args.sha == null) {
-				const blameline = editor?.selection.active.line ?? 0;
-				if (blameline < 0) return;
+					args.sha = first(log.commits.values())?.sha;
+					if (args.sha == null) return;
+				} else if (args.sha == null) {
+					const blameline = editor?.selection.active.line ?? 0;
+					if (blameline < 0) return;
 
-				try {
-					const gitUri = await GitUri.fromUri(uri);
-					const blame = await this.container.git.getBlameForLine(gitUri, blameline, editor?.document);
-					if (blame == null) return;
+					try {
+						const gitUri = await GitUri.fromUri(uri);
+						const blame = await this.container.git.getBlameForLine(gitUri, blameline, editor?.document);
+						if (blame == null) return;
 
-					args.sha = blame.commit.sha;
-				} catch (ex) {
-					Logger.error(ex, 'CopyShaToClipboardCommand', `getBlameForLine(${blameline})`);
-					void Messages.showGenericErrorMessage('Unable to copy commit SHA');
+						args.sha = blame.commit.sha;
+					} catch (ex) {
+						Logger.error(ex, 'CopyShaToClipboardCommand', `getBlameForLine(${blameline})`);
+						void showGenericErrorMessage('Unable to copy commit SHA');
 
-					return;
+						return;
+					}
 				}
 			}
 
-			void (await env.clipboard.writeText(args.sha));
+			await env.clipboard.writeText(
+				configuration.get('advanced.abbreviateShaOnCopy') ? shortenRevision(args.sha) : args.sha,
+			);
 		} catch (ex) {
 			Logger.error(ex, 'CopyShaToClipboardCommand');
-			void Messages.showGenericErrorMessage('Unable to copy commit SHA');
+			void showGenericErrorMessage('Unable to copy commit SHA');
 		}
 	}
 }

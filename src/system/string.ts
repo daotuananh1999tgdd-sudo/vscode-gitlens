@@ -1,15 +1,69 @@
-import ansiRegex from 'ansi-regex';
-import { md5 as _md5 } from '@env/crypto';
-import { hrtime } from '@env/hrtime';
-import { CharCode } from '../constants';
+import type {
+	WidthOptions as StringWidthOptions,
+	TruncationOptions as StringWidthTruncationOptions,
+	Result as TruncatedStringWidthResult,
+} from '@gk-nzaytsev/fast-string-truncated-width';
+import getTruncatedStringWidth from '@gk-nzaytsev/fast-string-truncated-width';
+import { hrtime } from '@env/hrtime.js';
+import { CharCode } from '../constants.js';
+import { getNumericFormat } from './date.js';
 
-export { fromBase64, base64 } from '@env/base64';
+export function capitalize(s: string): string {
+	return `${s[0].toLocaleUpperCase()}${s.slice(1)}`;
+}
 
-const compareCollator = new Intl.Collator(undefined, { sensitivity: 'accent' });
+let compareCollator: Intl.Collator | undefined;
 export function compareIgnoreCase(a: string, b: string): 0 | -1 | 1 {
+	compareCollator ??= new Intl.Collator(undefined, { sensitivity: 'accent' });
+
 	const result = compareCollator.compare(a, b);
 	// Intl.Collator.compare isn't guaranteed to always return 1 or -1 on all platforms so normalize it
 	return result === 0 ? 0 : result > 0 ? 1 : -1;
+}
+
+/**
+ * Removes common leading whitespace from each line in a template string.
+ * This allows you to write indented template strings but have them trimmed in the result.
+ *
+ * @param template The template string to dedent
+ * @returns The dedented string
+ *
+ * @example
+ * ```typescript
+ * const str = dedent(`
+ *     Hello
+ *     World
+ *     Test
+ * `);
+ * // Result: "Hello\nWorld\nTest"
+ * ```
+ */
+export function dedent(template: string): string {
+	const lines = template.split('\n');
+
+	// Remove leading and trailing empty lines
+	while (lines.length > 0 && lines[0].trim() === '') {
+		lines.shift();
+	}
+	while (lines.length > 0 && lines.at(-1)?.trim() === '') {
+		lines.pop();
+	}
+
+	if (lines.length === 0) return '';
+
+	// Find the minimum indentation (excluding empty lines)
+	const nonEmptyLines = lines.filter(line => line.trim() !== '');
+	if (nonEmptyLines.length === 0) return '';
+
+	const minIndent = Math.min(
+		...nonEmptyLines.map(line => {
+			const match = line.match(/^(\s*)/);
+			return match ? match[1].length : 0;
+		}),
+	);
+
+	// Remove the common indentation from all lines
+	return lines.map(line => line.slice(minIndent)).join('\n');
 }
 
 export function equalsIgnoreCase(a: string | null | undefined, b: string | null | undefined): boolean {
@@ -19,8 +73,11 @@ export function equalsIgnoreCase(a: string | null | undefined, b: string | null 
 	return compareIgnoreCase(a, b) === 0;
 }
 
-export const sortCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
-export const sortCompare = sortCollator.compare;
+let sortCollator: Intl.Collator | undefined;
+export function sortCompare(x: string, y: string): number {
+	sortCollator ??= new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+	return sortCollator.compare(x, y);
+}
 
 export function compareSubstring(
 	a: string,
@@ -94,57 +151,124 @@ export function compareSubstringIgnoreCase(
 	return 0;
 }
 
-const escapeMarkdownRegex = /[\\`*_{}[\]()#+\-.!]/g;
-const escapeMarkdownHeaderRegex = /^===/gm;
-// const sampleMarkdown = '## message `not code` *not important* _no underline_ \n> don\'t quote me \n- don\'t list me \n+ don\'t list me \n1. don\'t list me \nnot h1 \n=== \nnot h2 \n---\n***\n---\n___';
-const markdownQuotedRegex = /\n/g;
+export function countOccurrences(s: string, search: string): number {
+	let count = 0;
+	let position = 0;
 
-export function escapeMarkdown(s: string, options: { quoted?: boolean } = {}): string {
-	s = s
-		// Escape markdown
-		.replace(escapeMarkdownRegex, '\\$&')
-		// Escape markdown header (since the above regex won't match it)
-		.replace(escapeMarkdownHeaderRegex, '\u200b===');
+	while (true) {
+		position = s.indexOf(search, position);
+		if (position === -1) break;
 
-	if (!options.quoted) return s;
+		count++;
+		position += search.length;
+	}
 
-	// Keep under the same block-quote but with line breaks
-	return s.replace(markdownQuotedRegex, '\t\n>  ');
+	return count;
 }
 
-export function escapeRegex(s: string) {
+export function encodeHtmlWeak(s: string): string;
+export function encodeHtmlWeak(s: string | undefined): string | undefined;
+export function encodeHtmlWeak(s: string | undefined): string | undefined {
+	return s?.replace(/[<>&"]/g, c => {
+		switch (c) {
+			case '<':
+				return '&lt;';
+			case '>':
+				return '&gt;';
+			case '&':
+				return '&amp;';
+			case '"':
+				return '&quot;';
+			default:
+				return c;
+		}
+	});
+}
+
+export function escapeRegex(s: string): string {
 	return s.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&');
 }
 
-export function getDurationMilliseconds(start: [number, number]) {
+export function getDurationMilliseconds(start: [number, number]): number {
 	const [secs, nanosecs] = hrtime(start);
 	return secs * 1000 + Math.floor(nanosecs / 1000000);
 }
 
-export function* getLines(s: string, char: string = '\n'): IterableIterator<string> {
-	let i = 0;
-	while (i < s.length) {
-		let j = s.indexOf(char, i);
-		if (j === -1) {
-			j = s.length;
-		}
-
-		yield s.substring(i, j);
-		i = j + 1;
+/**
+ * Distributes a value into one of 100 groups based on a hash of the value
+ * @param value The value to distribute (e.g., machine ID)
+ * @returns A number between 1-100 representing the distribution group
+ */
+export function getDistributionGroup(value: string): number {
+	// Simple hash function
+	let hash = 0;
+	for (let i = 0; i < value.length; i++) {
+		hash = (hash << 5) - hash + value.charCodeAt(i);
+		hash = hash & hash; // Convert to 32-bit integer
 	}
+
+	// Convert hash to a number between 1-100
+	const group = Math.abs(hash % 100) + 1;
+	return group;
+}
+
+export function getPossessiveForm(name: string): string {
+	return name.endsWith('s') ? `${name}'` : `${name}'s`;
+}
+
+const defaultTruncationOptions: StringWidthTruncationOptions = {
+	ellipsisWidth: 0,
+	limit: 2 ** 30 - 1, // Max number that can be stored in V8's smis (small integers)
+};
+
+const defaultWidthOptions: StringWidthOptions = {
+	ansiWidth: 0,
+	controlWidth: 0,
+	ambiguousWidth: 1,
+	emojiWidth: 2,
+	fullWidthWidth: 2,
+	regularWidth: 1,
+	wideWidth: 2,
+};
+
+export function getTruncatedWidth(s: string, limit: number, ellipsisWidth: number): TruncatedStringWidthResult {
+	if (s == null || s.length === 0) {
+		return {
+			truncated: false,
+			ellipsed: false,
+			width: 0,
+			index: 0,
+		};
+	}
+
+	return getTruncatedStringWidth(s, { limit: limit, ellipsisWidth: ellipsisWidth ?? 0 }, defaultWidthOptions);
+}
+
+export function getWidth(s: string): number {
+	if (s == null || s.length === 0) return 0;
+
+	const result = getTruncatedStringWidth(s, defaultTruncationOptions, defaultWidthOptions);
+	return result.width;
 }
 
 const superscripts = ['\u00B9', '\u00B2', '\u00B3', '\u2074', '\u2075', '\u2076', '\u2077', '\u2078', '\u2079'];
 
-export function getSuperscript(num: number) {
+export function getSuperscript(num: number): string {
 	return superscripts[num - 1] ?? '';
 }
 
-const tokenRegex = /\$\{('.*?[^\\]'|\W*)?([^|]*?)(?:\|(\d+)(-|\?)?)?('.*?[^\\]'|\W*)?\}/g;
+const tokenRegex = /\$\{(?:'(.*?[^\\])'|(\W*))?([^|]*?)(?:\|(\d+)(-|\?)?)?(?:'(.*?[^\\])'|(\W*))?\}/g;
 const tokenSanitizeRegex = /\$\{(?:'.*?[^\\]'|\W*)?(\w*?)(?:'.*?[^\\]'|[\W\d]*)\}/g;
 const tokenGroupCharacter = "'";
 const tokenGroupCharacterEscapedRegex = /(\\')/g;
-const tokenGroupRegex = /^'?(.*?)'?$/;
+
+interface TokenMatch {
+	key: string;
+	start: number;
+	end: number;
+	options: TokenOptions;
+}
+const templateTokenMap = new Map<string, TokenMatch[]>();
 
 export interface TokenOptions {
 	collapseWhitespace: boolean;
@@ -154,88 +278,467 @@ export interface TokenOptions {
 	truncateTo: number | undefined;
 }
 
-export function getTokensFromTemplate(template: string) {
-	const tokens: { key: string; options: TokenOptions }[] = [];
+function isWordChar(code: number): boolean {
+	return (
+		code === 95 /* _ */ ||
+		(code >= 0x61 && code <= 0x7a) || // lowercase letters
+		(code >= 0x41 && code <= 0x5a) || // uppercase letters
+		(code >= 0x30 && code <= 0x39) // digits
+	);
+}
 
-	let match;
-	do {
-		match = tokenRegex.exec(template);
-		if (match == null) break;
+export function getTokensFromTemplate(template: string): TokenMatch[] {
+	let tokens = templateTokenMap.get(template);
+	if (tokens != null) return tokens;
 
-		let [, prefix, key, truncateTo, option, suffix] = match;
-		// Check for a prefix group
-		if (prefix != null) {
-			match = tokenGroupRegex.exec(prefix);
-			if (match != null) {
-				[, prefix] = match;
-				prefix = prefix.replace(tokenGroupCharacterEscapedRegex, tokenGroupCharacter);
+	tokens = [];
+	const length = template.length;
+
+	let position = 0;
+	while (position < length) {
+		const tokenStart = template.indexOf('${', position);
+		if (tokenStart === -1) break;
+
+		const tokenEnd = template.indexOf('}', tokenStart);
+		if (tokenEnd === -1) break;
+
+		let tokenPos = tokenStart + 2;
+
+		let key = '';
+		let prefix = '';
+		let truncateTo = '';
+		let collapseWhitespace = false;
+		let padDirection: 'left' | 'right' = 'right';
+		let suffix = '';
+
+		if (template[tokenPos] === "'") {
+			const start = ++tokenPos;
+			tokenPos = template.indexOf("'", tokenPos);
+			if (tokenPos === -1) break;
+
+			if (start !== tokenPos) {
+				prefix = template.slice(start, tokenPos);
+			}
+			tokenPos++;
+		} else if (!isWordChar(template.charCodeAt(tokenPos))) {
+			const start = tokenPos++;
+			while (tokenPos < tokenEnd && !isWordChar(template.charCodeAt(tokenPos))) {
+				tokenPos++;
+			}
+
+			if (start !== tokenPos) {
+				prefix = template.slice(start, tokenPos);
 			}
 		}
 
-		// Check for a suffix group
-		if (suffix != null) {
-			match = tokenGroupRegex.exec(suffix);
-			if (match != null) {
-				[, suffix] = match;
-				suffix = suffix.replace(tokenGroupCharacterEscapedRegex, tokenGroupCharacter);
+		while (tokenPos < tokenEnd) {
+			let code = template.charCodeAt(tokenPos);
+			if (isWordChar(code)) {
+				key += template[tokenPos++];
+			} else {
+				if (code !== 0x7c /* | */) break;
+
+				while (tokenPos < tokenEnd) {
+					code = template.charCodeAt(++tokenPos);
+					if (code >= 0x30 && code <= 0x39 /* digits */) {
+						truncateTo += template[tokenPos];
+						continue;
+					}
+
+					if (code === 0x3f /* ? */) {
+						collapseWhitespace = true;
+						tokenPos++;
+					} else if (code === 0x2d /* - */) {
+						padDirection = 'left';
+						tokenPos++;
+					}
+
+					break;
+				}
 			}
+		}
+
+		if (tokenPos < tokenEnd) {
+			if (template[tokenPos] === "'") {
+				const start = ++tokenPos;
+				tokenPos = template.indexOf("'", tokenPos);
+				if (tokenPos === -1) break;
+
+				if (start !== tokenPos) {
+					suffix = template.slice(start, tokenPos);
+				}
+				tokenPos++;
+			} else if (!isWordChar(template.charCodeAt(tokenPos))) {
+				const start = tokenPos++;
+				while (tokenPos < tokenEnd && !isWordChar(template.charCodeAt(tokenPos))) {
+					tokenPos++;
+				}
+
+				if (start !== tokenPos) {
+					suffix = template.slice(start, tokenPos);
+				}
+			}
+		}
+
+		position = tokenEnd + 1;
+		tokens.push({
+			key: key,
+			start: tokenStart,
+			end: position,
+			options: {
+				prefix: prefix || undefined,
+				suffix: suffix || undefined,
+				truncateTo: truncateTo ? parseInt(truncateTo, 10) : undefined,
+				collapseWhitespace: collapseWhitespace,
+				padDirection: padDirection,
+			},
+		});
+	}
+
+	templateTokenMap.set(template, tokens);
+	return tokens;
+}
+
+// FYI, this is about twice as slow as getTokensFromTemplate
+export function getTokensFromTemplateRegex(template: string): TokenMatch[] {
+	let tokens = templateTokenMap.get(template);
+	if (tokens != null) return tokens;
+
+	tokens = [];
+
+	let match;
+	while ((match = tokenRegex.exec(template))) {
+		const [, prefixGroup, prefixNonGroup, key, truncateTo, option, suffixGroup, suffixNonGroup] = match;
+		const start = match.index;
+		const end = start + match[0].length;
+
+		let prefix = prefixGroup || prefixNonGroup || undefined;
+		if (prefix) {
+			prefix = prefix.replace(tokenGroupCharacterEscapedRegex, tokenGroupCharacter);
+		}
+
+		let suffix = suffixGroup || suffixNonGroup || undefined;
+		if (suffix) {
+			suffix = suffix.replace(tokenGroupCharacterEscapedRegex, tokenGroupCharacter);
 		}
 
 		tokens.push({
 			key: key,
+			start: start,
+			end: end,
 			options: {
 				collapseWhitespace: option === '?',
 				padDirection: option === '-' ? 'left' : 'right',
-				prefix: prefix || undefined,
-				suffix: suffix || undefined,
+				prefix: prefix,
+				suffix: suffix,
 				truncateTo: truncateTo == null ? undefined : parseInt(truncateTo, 10),
 			},
 		});
-	} while (true);
+	}
 
+	templateTokenMap.set(template, tokens);
 	return tokens;
 }
 
-const tokenSanitizeReplacement = `$\${$1=this.$1,($1 == null ? '' : $1)}`;
-const interpolationMap = new Map<string, Function>();
+/**
+ * Fast string delimiter iterator
+ * Optimized for simple string splitting without generator overhead
+ */
+class StringDelimiterIterator implements IterableIterator<string> {
+	private readonly delimiterLen: number;
+	private index = 0;
+	private done = false;
+
+	constructor(
+		private readonly data: string,
+		private readonly delimiter: string,
+	) {
+		this.delimiterLen = delimiter.length;
+	}
+
+	next(): IteratorResult<string> {
+		if (this.done || this.index >= this.data.length) {
+			this.done = true;
+			return { done: true, value: undefined };
+		}
+
+		const j = this.data.indexOf(this.delimiter, this.index);
+		const endIndex = j === -1 ? this.data.length : j;
+
+		const value = this.data.substring(this.index, endIndex);
+		this.index = endIndex + this.delimiterLen;
+
+		return { done: false, value: value };
+	}
+
+	[Symbol.iterator](): IterableIterator<string> {
+		return this;
+	}
+}
+
+/**
+ * Iterable delimiter iterator with buffering
+ * Handles streaming data by buffering incomplete segments
+ */
+class IterableDelimiterIterator implements IterableIterator<string> {
+	private readonly delimiterLen: number;
+	private readonly iterator: Iterator<string>;
+	private readonly isArray: boolean;
+	private readonly arrayLength: number;
+
+	private arrayCount = 0;
+	private buffer = '';
+	private bufferIndex = 0;
+	private needsMoreData = true;
+	private done = false;
+
+	constructor(
+		data: Iterable<string>,
+		private readonly delimiter: string,
+	) {
+		this.delimiterLen = delimiter.length;
+		this.isArray = Array.isArray(data);
+		this.arrayLength = this.isArray ? (data as string[]).length : 0;
+		this.iterator = data[Symbol.iterator]();
+	}
+
+	next(): IteratorResult<string> {
+		if (this.done) {
+			return { done: true, value: undefined };
+		}
+
+		while (true) {
+			// Try to find delimiter in current buffer
+			if (this.bufferIndex < this.buffer.length) {
+				const j = this.buffer.indexOf(this.delimiter, this.bufferIndex);
+
+				if (j !== -1) {
+					// Found delimiter - return the segment
+					const value = this.buffer.substring(this.bufferIndex, j);
+					this.bufferIndex = j + this.delimiterLen;
+					return { done: false, value: value };
+				}
+
+				// No delimiter found in buffer
+				if (!this.needsMoreData) {
+					// No more data coming - yield rest of buffer
+					if (this.bufferIndex < this.buffer.length) {
+						const value = this.buffer.substring(this.bufferIndex);
+						this.bufferIndex = this.buffer.length;
+						this.done = true;
+						return { done: false, value: value };
+					}
+					this.done = true;
+					return { done: true, value: undefined };
+				}
+
+				// Need more data - keep unprocessed part as leftover
+				if (this.bufferIndex > 0) {
+					this.buffer = this.buffer.substring(this.bufferIndex);
+					this.bufferIndex = 0;
+				}
+			}
+
+			// Fetch next chunk if needed
+			if (this.needsMoreData) {
+				const result = this.iterator.next();
+
+				if (result.done) {
+					this.needsMoreData = false;
+
+					// Yield any remaining buffer content
+					if (this.buffer.length > 0) {
+						const value = this.buffer;
+						this.buffer = '';
+						this.done = true;
+						return { done: false, value: value };
+					}
+
+					this.done = true;
+					return { done: true, value: undefined };
+				}
+
+				// Track array iteration
+				if (this.isArray) {
+					this.arrayCount++;
+					if (this.arrayCount === this.arrayLength) {
+						this.needsMoreData = false;
+					}
+				}
+
+				// Append chunk to buffer
+				this.buffer += result.value;
+			} else {
+				// No more data and buffer is empty
+				this.done = true;
+				return { done: true, value: undefined };
+			}
+		}
+	}
+
+	[Symbol.iterator](): IterableIterator<string> {
+		return this;
+	}
+}
+
+/**
+ * Iterate over a string or iterable by delimiter without using generators
+ * More performant than generator version while maintaining lazy evaluation
+ */
+export function iterateByDelimiter(data: string | Iterable<string>, delimiter: string): IterableIterator<string> {
+	if (typeof data === 'string') {
+		return new StringDelimiterIterator(data, delimiter);
+	}
+	return new IterableDelimiterIterator(data, delimiter);
+}
+
+/**
+ * Async iterable delimiter iterator with buffering
+ * Handles streaming async data by buffering incomplete segments
+ */
+class AsyncIterableDelimiterIterator implements AsyncIterableIterator<string> {
+	private readonly delimiterLen: number;
+	private readonly iterator: AsyncIterator<string>;
+
+	private buffer = '';
+	private bufferIndex = 0;
+	private needsMoreData = true;
+	private done = false;
+
+	constructor(
+		data: AsyncIterable<string>,
+		private readonly delimiter: string,
+	) {
+		this.delimiterLen = delimiter.length;
+		this.iterator = data[Symbol.asyncIterator]();
+	}
+
+	async next(): Promise<IteratorResult<string>> {
+		if (this.done) {
+			return { done: true, value: undefined };
+		}
+
+		while (true) {
+			// Try to find delimiter in current buffer
+			if (this.bufferIndex < this.buffer.length) {
+				const j = this.buffer.indexOf(this.delimiter, this.bufferIndex);
+
+				if (j !== -1) {
+					// Found delimiter - return the segment
+					const value = this.buffer.substring(this.bufferIndex, j);
+					this.bufferIndex = j + this.delimiterLen;
+					return { done: false, value: value };
+				}
+
+				// No delimiter found in buffer
+				if (!this.needsMoreData) {
+					// No more data coming - yield rest of buffer
+					if (this.bufferIndex < this.buffer.length) {
+						const value = this.buffer.substring(this.bufferIndex);
+						this.bufferIndex = this.buffer.length;
+						this.done = true;
+						return { done: false, value: value };
+					}
+					this.done = true;
+					return { done: true, value: undefined };
+				}
+
+				// Need more data - keep unprocessed part as leftover
+				if (this.bufferIndex > 0) {
+					this.buffer = this.buffer.substring(this.bufferIndex);
+					this.bufferIndex = 0;
+				}
+			}
+
+			// Fetch next chunk if needed
+			if (this.needsMoreData) {
+				const result = await this.iterator.next();
+
+				if (result.done) {
+					this.needsMoreData = false;
+
+					// Yield any remaining unprocessed buffer content
+					if (this.bufferIndex < this.buffer.length) {
+						const value = this.buffer.substring(this.bufferIndex);
+						this.bufferIndex = this.buffer.length;
+						this.done = true;
+						return { done: false, value: value };
+					}
+
+					this.done = true;
+					return { done: true, value: undefined };
+				}
+
+				// Append chunk to buffer
+				this.buffer += result.value;
+			} else {
+				// No more data and buffer is empty
+				this.done = true;
+				return { done: true, value: undefined };
+			}
+		}
+	}
+
+	[Symbol.asyncIterator](): AsyncIterableIterator<string> {
+		return this;
+	}
+}
+
+/**
+ * Iterate over an async iterable by delimiter without using generators
+ * More performant than generator version while maintaining lazy evaluation
+ */
+export function iterateAsyncByDelimiter(data: AsyncIterable<string>, delimiter: string): AsyncIterableIterator<string> {
+	return new AsyncIterableDelimiterIterator(data, delimiter);
+}
 
 export function interpolate(template: string, context: object | undefined): string {
 	if (template == null || template.length === 0) return template;
 	if (context == null) return template.replace(tokenSanitizeRegex, '');
 
-	let fn = interpolationMap.get(template);
-	if (fn == null) {
-		// eslint-disable-next-line @typescript-eslint/no-implied-eval
-		fn = new Function(`return \`${template.replace(tokenSanitizeRegex, tokenSanitizeReplacement)}\`;`);
-		interpolationMap.set(template, fn);
+	const tokens = getTokensFromTemplate(template);
+	if (tokens.length === 0) return template;
+
+	let position = 0;
+	let result = '';
+	for (const token of tokens) {
+		result += template.slice(position, token.start) + ((context as Record<string, string>)[token.key] ?? '');
+		position = token.end;
 	}
 
-	return fn.call(context);
+	if (position < template.length) {
+		result += template.slice(position);
+	}
+
+	return result;
 }
-
-// eslint-disable-next-line prefer-arrow-callback
-const AsyncFunction = Object.getPrototypeOf(async function () {
-	/* noop */
-}).constructor;
-
-const tokenSanitizeReplacementAsync = `$\${$1=this.$1,($1 == null ? '' : typeof $1.then === 'function' ? (($1 = await $1),$1 == null ? '' : $1) : $1)}`;
-
-const interpolationAsyncMap = new Map<string, typeof AsyncFunction>();
 
 export async function interpolateAsync(template: string, context: object | undefined): Promise<string> {
 	if (template == null || template.length === 0) return template;
 	if (context == null) return template.replace(tokenSanitizeRegex, '');
 
-	let fn = interpolationAsyncMap.get(template);
-	if (fn == null) {
-		// // eslint-disable-next-line @typescript-eslint/no-implied-eval
-		const body = `return \`${template.replace(tokenSanitizeRegex, tokenSanitizeReplacementAsync)}\`;`;
-		fn = new AsyncFunction(body);
-		interpolationAsyncMap.set(template, fn);
+	const tokens = getTokensFromTemplate(template);
+	if (tokens.length === 0) return template;
+
+	let position = 0;
+	let result = '';
+	let value;
+	for (const token of tokens) {
+		value = (context as Record<string, any>)[token.key];
+		if (value != null && typeof value === 'object' && typeof value.then === 'function') {
+			value = await value;
+		}
+
+		// eslint-disable-next-line @typescript-eslint/restrict-plus-operands
+		result += template.slice(position, token.start) + (value ?? '');
+		position = token.end;
 	}
 
-	const value = await fn.call(context);
-	return value;
+	if (position < template.length) {
+		result += template.slice(position);
+	}
+
+	return result;
 }
 
 export function isLowerAsciiLetter(code: number): boolean {
@@ -246,49 +749,19 @@ export function isUpperAsciiLetter(code: number): boolean {
 	return code >= CharCode.A && code <= CharCode.Z;
 }
 
-export function md5(s: string, encoding: 'base64' | 'hex' = 'base64'): string {
-	return _md5(s, encoding);
-}
-
-export function pad(s: string, before: number = 0, after: number = 0, padding: string = '\u00a0') {
+export function pad(s: string, before: number = 0, after: number = 0, padding: string = '\u00a0'): string {
 	if (before === 0 && after === 0) return s;
 
 	return `${before === 0 ? '' : padding.repeat(before)}${s}${after === 0 ? '' : padding.repeat(after)}`;
 }
 
-export function padLeft(s: string, padTo: number, padding: string = '\u00a0', width?: number) {
-	const diff = padTo - (width ?? getWidth(s));
-	return diff <= 0 ? s : padding.repeat(diff) + s;
+export function padOrTruncateEnd(s: string, maxLength: number, fillString?: string): string {
+	if (s.length === maxLength) return s;
+	if (s.length > maxLength) return s.substring(0, maxLength);
+	return s.padEnd(maxLength, fillString);
 }
 
-export function padLeftOrTruncate(s: string, max: number, padding?: string, width?: number) {
-	width = width ?? getWidth(s);
-	if (width < max) return padLeft(s, max, padding, width);
-	if (width > max) return truncate(s, max, undefined, width);
-	return s;
-}
-
-export function padRight(s: string, padTo: number, padding: string = '\u00a0', width?: number) {
-	const diff = padTo - (width ?? getWidth(s));
-	return diff <= 0 ? s : s + padding.repeat(diff);
-}
-
-export function padOrTruncate(s: string, max: number, padding?: string, width?: number) {
-	const left = max < 0;
-	max = Math.abs(max);
-
-	width = width ?? getWidth(s);
-	if (width < max) return left ? padLeft(s, max, padding, width) : padRight(s, max, padding, width);
-	if (width > max) return truncate(s, max, undefined, width);
-	return s;
-}
-
-export function padRightOrTruncate(s: string, max: number, padding?: string, width?: number) {
-	width = width ?? getWidth(s);
-	if (width < max) return padRight(s, max, padding, width);
-	if (width > max) return truncate(s, max);
-	return s;
-}
+let numericFormat: ReturnType<typeof getNumericFormat> | undefined;
 
 export function pluralize(
 	s: string,
@@ -297,7 +770,7 @@ export function pluralize(
 		/** Controls the character/string between the count and the string */
 		infix?: string;
 		/** Formats the count */
-		format?: (count: number) => string | undefined;
+		format?: false | ((count: number) => string | undefined);
 		/** Controls if only the string should be included */
 		only?: boolean;
 		/** Controls the plural version of the string */
@@ -305,38 +778,56 @@ export function pluralize(
 		/** Controls the string for a zero value */
 		zero?: string;
 	},
-) {
-	if (options == null) return `${count} ${s}${count === 1 ? '' : 's'}`;
+): string {
+	if (options == null) {
+		numericFormat ??= getNumericFormat();
+		return `${numericFormat(count)} ${s}${count === 1 ? '' : 's'}`;
+	}
 
-	const suffix = count === 1 ? s : options.plural ?? `${s}s`;
+	const suffix = count === 1 ? s : (options.plural ?? `${s}s`);
 	if (options.only) return suffix;
 
-	return `${count === 0 ? options.zero ?? count : options.format?.(count) ?? count}${options.infix ?? ' '}${suffix}`;
+	let result;
+	if (count === 0) {
+		result = options.zero ?? count;
+	} else if (options.format === false) {
+		result = count;
+	} else if (options.format != null) {
+		result = options.format(count);
+	} else {
+		numericFormat ??= getNumericFormat();
+		result = numericFormat(count);
+	}
+
+	return `${result}${options.infix ?? ' '}${suffix}`;
 }
 
 // Removes \ / : * ? " < > | and C0 and C1 control codes
 // eslint-disable-next-line no-control-regex
 const illegalCharsForFSRegex = /[\\/:*?"<>|\x00-\x1f\x80-\x9f]/g;
 
-export function sanitizeForFileSystem(s: string, replacement: string = '_') {
+export function sanitizeForFileSystem(s: string, replacement: string = '_'): string {
 	if (!s) return s;
 	return s.replace(illegalCharsForFSRegex, replacement);
 }
 
-export function splitLast(s: string, splitter: string) {
+export function splitLast(s: string, splitter: string): string[] {
 	const index = s.lastIndexOf(splitter);
 	if (index === -1) return [s];
 
-	return [s.substr(index), s.substring(0, index - 1)];
+	return [s.substring(index), s.substring(0, index - 1)];
 }
 
-export function splitSingle(s: string, splitter: string) {
-	const parts = s.split(splitter, 1);
-	const first = parts[0];
-	return first.length === s.length ? parts : [first, s.substr(first.length + 1)];
+export function splitSingle(s: string, splitter: string): string[] {
+	const index = s.indexOf(splitter);
+	if (index === -1) return [s];
+
+	const start = s.substring(0, index);
+	const rest = s.substring(index + splitter.length);
+	return rest != null ? [start, rest] : [start];
 }
 
-export function truncate(s: string, truncateTo: number, ellipsis: string = '\u2026', width?: number) {
+export function truncate(s: string, truncateTo: number, ellipsis: string = '\u2026', width?: number): string {
 	if (!s) return s;
 	if (truncateTo <= 1) return ellipsis;
 
@@ -358,7 +849,7 @@ export function truncate(s: string, truncateTo: number, ellipsis: string = '\u20
 	return `${s.substring(0, chars)}${ellipsis}`;
 }
 
-export function truncateLeft(s: string, truncateTo: number, ellipsis: string = '\u2026', width?: number) {
+export function truncateLeft(s: string, truncateTo: number, ellipsis: string = '\u2026', width?: number): string {
 	if (!s) return s;
 	if (truncateTo <= 1) return ellipsis;
 
@@ -380,7 +871,7 @@ export function truncateLeft(s: string, truncateTo: number, ellipsis: string = '
 	return `${ellipsis}${s.substring(s.length - chars)}`;
 }
 
-export function truncateMiddle(s: string, truncateTo: number, ellipsis: string = '\u2026') {
+export function truncateMiddle(s: string, truncateTo: number, ellipsis: string = '\u2026'): string {
 	if (!s) return s;
 	if (truncateTo <= 1) return ellipsis;
 
@@ -390,112 +881,120 @@ export function truncateMiddle(s: string, truncateTo: number, ellipsis: string =
 	return `${s.slice(0, Math.floor(truncateTo / 2) - 1)}${ellipsis}${s.slice(width - Math.ceil(truncateTo / 2))}`;
 }
 
-let cachedAnsiRegex: RegExp | undefined;
-const containsNonAsciiRegex = /[^\x20-\x7F\u00a0\u2026]/;
+// Below adapted from https://github.com/pieroxy/lz-string
 
-// See sindresorhus/string-width
-export function getWidth(s: string): number {
-	if (s == null || s.length === 0) return 0;
+// Pre-computed from:
+// const base64ReverseMap = new Uint8Array(123);
+// const base64Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+// for (let i = 0; i < base64Chars.length; i++) {
+// 	base64ReverseMap[base64Chars.charCodeAt(i)] = i;
+// }
 
-	// Shortcut to avoid needless string `RegExp`s, replacements, and allocations
-	if (!containsNonAsciiRegex.test(s)) return s.length;
+const base64ReverseMap = new Uint8Array([
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 62, 0, 0, 0, 63, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 0, 0, 0, 64, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7,
+	8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 0, 0, 0, 0, 0, 0, 26, 27, 28, 29, 30, 31, 32,
+	33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51,
+]);
 
-	if (cachedAnsiRegex == null) {
-		cachedAnsiRegex = ansiRegex();
-	}
-	s = s.replace(cachedAnsiRegex, '');
+export function decompressFromBase64LZString(input: string | undefined): string {
+	if (input == null || input === '') return '';
 
-	let count = 0;
-	let emoji = 0;
-	let joiners = 0;
-
-	const graphemes = [...s];
-	for (let i = 0; i < graphemes.length; i++) {
-		const code = graphemes[i].codePointAt(0)!;
-
-		// Ignore control characters
-		if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) continue;
-
-		// Ignore combining characters
-		if (code >= 0x300 && code <= 0x36f) continue;
-
-		if (
-			(code >= 0x1f600 && code <= 0x1f64f) || // Emoticons
-			(code >= 0x1f300 && code <= 0x1f5ff) || // Misc Symbols and Pictographs
-			(code >= 0x1f680 && code <= 0x1f6ff) || // Transport and Map
-			(code >= 0x2600 && code <= 0x26ff) || // Misc symbols
-			(code >= 0x2700 && code <= 0x27bf) || // Dingbats
-			(code >= 0xfe00 && code <= 0xfe0f) || // Variation Selectors
-			(code >= 0x1f900 && code <= 0x1f9ff) || // Supplemental Symbols and Pictographs
-			(code >= 65024 && code <= 65039) || // Variation selector
-			(code >= 8400 && code <= 8447) // Combining Diacritical Marks for Symbols
-		) {
-			if (code >= 0x1f3fb && code <= 0x1f3ff) continue; // emoji modifier fitzpatrick type
-
-			emoji++;
-			count += 2;
-			continue;
-		}
-
-		// Ignore zero-width joiners '\u200d'
-		if (code === 8205) {
-			joiners++;
-			count -= 2;
-			continue;
-		}
-
-		// Surrogates
-		if (code > 0xffff) {
-			i++;
-		}
-
-		count += isFullwidthCodePoint(code) ? 2 : 1;
-	}
-
-	const offset = emoji - joiners;
-	if (offset > 1) {
-		count += offset - 1;
-	}
-	return count;
+	const result = _decompressLZString(input, 32) ?? '';
+	return result;
 }
 
-// See sindresorhus/is-fullwidth-code-point
-function isFullwidthCodePoint(cp: number) {
-	// code points are derived from:
-	// http://www.unix.org/Public/UNIDATA/EastAsianWidth.txt
-	if (
-		cp >= 0x1100 &&
-		(cp <= 0x115f || // Hangul Jamo
-			cp === 0x2329 || // LEFT-POINTING ANGLE BRACKET
-			cp === 0x232a || // RIGHT-POINTING ANGLE BRACKET
-			// CJK Radicals Supplement .. Enclosed CJK Letters and Months
-			(cp >= 0x2e80 && cp <= 0x3247 && cp !== 0x303f) ||
-			// Enclosed CJK Letters and Months .. CJK Unified Ideographs Extension A
-			(cp >= 0x3250 && cp <= 0x4dbf) ||
-			// CJK Unified Ideographs .. Yi Radicals
-			(cp >= 0x4e00 && cp <= 0xa4c6) ||
-			// Hangul Jamo Extended-A
-			(cp >= 0xa960 && cp <= 0xa97c) ||
-			// Hangul Syllables
-			(cp >= 0xac00 && cp <= 0xd7a3) ||
-			// CJK Compatibility Ideographs
-			(cp >= 0xf900 && cp <= 0xfaff) ||
-			// Vertical Forms
-			(cp >= 0xfe10 && cp <= 0xfe19) ||
-			// CJK Compatibility Forms .. Small Form Variants
-			(cp >= 0xfe30 && cp <= 0xfe6b) ||
-			// Halfwidth and Fullwidth Forms
-			(cp >= 0xff01 && cp <= 0xff60) ||
-			(cp >= 0xffe0 && cp <= 0xffe6) ||
-			// Kana Supplement
-			(cp >= 0x1b000 && cp <= 0x1b001) ||
-			// Enclosed Ideographic Supplement
-			(cp >= 0x1f200 && cp <= 0x1f251) ||
-			// CJK Unified Ideographs Extension B .. Tertiary Ideographic Plane
-			(cp >= 0x20000 && cp <= 0x3fffd))
-	) {
-		return true;
+function _decompressLZString(input: string, resetValue: number) {
+	const dictionary = new Array<string>(4096);
+	dictionary[0] = '0';
+	dictionary[1] = '1';
+	dictionary[2] = '2';
+
+	const result: string[] = [];
+	const length = input.length;
+
+	let val = base64ReverseMap[input.charCodeAt(0)];
+	let position = resetValue;
+	let index = 1;
+
+	function readBits(maxpower: number): number {
+		let bits = 0;
+		let power = 1;
+		do {
+			bits |= Number((val & position) > 0) * power;
+			power <<= 1;
+
+			position >>= 1;
+			if (position === 0) {
+				position = resetValue;
+				val = base64ReverseMap[input.charCodeAt(index++)];
+			}
+		} while (power !== maxpower);
+
+		return bits;
 	}
 
-	return false;
+	let c = readBits(4);
+
+	switch (c) {
+		case 0:
+			c = readBits(256);
+			break;
+		case 1:
+			c = readBits(65536);
+			break;
+		case 2:
+			return '';
+	}
+
+	let w = String.fromCharCode(c);
+	dictionary[3] = w;
+	result.push(w);
+
+	let dictSize = 4;
+	let enlargeIn = 4;
+	let numBits = 3;
+
+	while (index <= length) {
+		c = readBits(1 << numBits);
+
+		switch (c) {
+			case 0:
+				c = readBits(256);
+				dictionary[dictSize] = String.fromCharCode(c);
+				c = dictSize++;
+				enlargeIn--;
+				break;
+			case 1:
+				c = readBits(65536);
+				dictionary[dictSize] = String.fromCharCode(c);
+				c = dictSize++;
+				enlargeIn--;
+				break;
+			case 2:
+				return result.join('');
+		}
+
+		if (enlargeIn === 0) {
+			enlargeIn = 1 << numBits++;
+		}
+
+		let entry = dictionary[c];
+		if (entry === undefined) {
+			if (c !== dictSize) return undefined;
+
+			entry = w + w[0];
+		}
+
+		result.push(entry);
+		dictionary[dictSize++] = w + entry[0];
+		enlargeIn--;
+		w = entry;
+
+		if (enlargeIn === 0) {
+			enlargeIn = 1 << numBits++;
+		}
+	}
+
+	return undefined;
 }

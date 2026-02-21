@@ -1,14 +1,97 @@
-import { debug } from '../../system/decorators/log';
-import { GitRemote } from '../models';
-import { GitRemoteType } from '../models/remote';
-import { RemoteProvider } from '../remotes/provider';
+import type { Container } from '../../container.js';
+import { maybeStopWatch } from '../../system/stopwatch.js';
+import { iterateByDelimiter } from '../../system/string.js';
+import type { GitRemoteType } from '../models/remote.js';
+import { GitRemote } from '../models/remote.js';
+import type { getRemoteProviderMatcher } from '../remotes/remoteProviders.js';
 
-const emptyStr = '';
+export function parseGitRemotes(
+	container: Container,
+	data: string,
+	repoPath: string,
+	remoteProviderMatcher: Awaited<ReturnType<typeof getRemoteProviderMatcher>>,
+): GitRemote[] {
+	using sw = maybeStopWatch(`Git.parseRemotes(${repoPath})`, { log: { onlyExit: true, level: 'debug' } });
+	if (!data) {
+		sw?.stop({ suffix: ` no data` });
+		return [];
+	}
 
-const remoteRegex = /^(.*)\t(.*)\s\((.*)\)$/gm;
-const urlRegex =
-	/^(?:(git:\/\/)(.*?)\/|(https?:\/\/)(?:.*?@)?(.*?)\/|git@(.*):|(ssh:\/\/)(?:.*@)?(.*?)(?::.*?)?(?:\/|(?=~))|(?:.*?@)(.*?):)(.*)$/;
+	// Format: <name>\t<url> (<type>)
 
+	const remotes = new Map<string, GitRemote>();
+
+	let name: string;
+	let url: string;
+	let type: GitRemoteType;
+
+	let scheme: string;
+	let domain: string;
+	let path: string;
+
+	let remote: GitRemote | undefined;
+
+	let startIndex = 0;
+	let endIndex = 0;
+
+	for (let line of iterateByDelimiter(data, '\n')) {
+		line = line.trim();
+		if (!line) continue;
+
+		// Parse name
+		startIndex = 0;
+		endIndex = line.indexOf('\t');
+		if (endIndex === -1) continue;
+
+		name = line.substring(startIndex, endIndex);
+
+		// Parse url
+		startIndex = endIndex + 1;
+		endIndex = line.lastIndexOf(' (');
+		if (endIndex === -1) continue;
+
+		url = line.substring(startIndex, endIndex);
+
+		// Parse type
+		startIndex = endIndex + 2;
+		endIndex = line.lastIndexOf(')');
+		if (endIndex === -1) continue;
+
+		type = line.substring(startIndex, endIndex) as GitRemoteType;
+
+		[scheme, domain, path] = parseGitRemoteUrl(url);
+
+		remote = remotes.get(name);
+		if (remote == null) {
+			remote = new GitRemote(
+				container,
+				repoPath,
+				name,
+				scheme,
+				domain,
+				path,
+				remoteProviderMatcher(url, domain, path, scheme),
+				[{ url: url, type: type }],
+			);
+			remotes.set(name, remote);
+		} else {
+			remote.urls.push({ url: url, type: type });
+			if (remote.provider != null && type !== 'push') continue;
+
+			const provider = remoteProviderMatcher(url, domain, path, scheme);
+			if (provider == null) continue;
+
+			remote = new GitRemote(container, repoPath, name, scheme, domain, path, provider, remote.urls);
+			remotes.set(name, remote);
+		}
+	}
+
+	sw?.stop({ suffix: ` parsed ${remotes.size} remotes` });
+
+	return [...remotes.values()];
+}
+
+export const gitSuffixRegex = /\.git\/?$/;
 // Test git urls
 /*
 http://host.xz/user/project.git
@@ -46,78 +129,16 @@ user:password@host.xz:project.git
 user:password@host.xz:/path/to/repo.git
 user:password@host.xz:/path/to/repo.git/
 */
+export const remoteUrlRegex =
+	/^(?:(git:\/\/)(.*?)\/|(https?:\/\/)(?:.*?@)?(.*?)\/|git@(.*):|(ssh:\/\/)(?:.*@)?(.*?)(?::.*?)?(?:\/|(?=~))|(?:.*?@)(.*?):)(.*)$/;
 
-export class GitRemoteParser {
-	@debug({ args: false, singleLine: true })
-	static parse(
-		data: string,
-		repoPath: string,
-		providerFactory: (url: string, domain: string, path: string) => RemoteProvider | undefined,
-	): GitRemote[] | undefined {
-		if (!data) return undefined;
+export function parseGitRemoteUrl(url: string): [scheme: string, domain: string, path: string] {
+	const match = remoteUrlRegex.exec(url);
+	if (match == null) return ['', '', url];
 
-		const remotes: GitRemote[] = [];
-		const groups = Object.create(null) as Record<string, GitRemote | undefined>;
-
-		let name;
-		let url;
-		let type;
-
-		let scheme;
-		let domain;
-		let path;
-
-		let uniqueness;
-		let remote: GitRemote | undefined;
-
-		let match;
-		do {
-			match = remoteRegex.exec(data);
-			if (match == null) break;
-
-			[, name, url, type] = match;
-
-			// Stops excessive memory usage -- https://bugs.chromium.org/p/v8/issues/detail?id=2869
-			url = ` ${url}`.substr(1);
-
-			[scheme, domain, path] = this.parseGitUrl(url);
-
-			uniqueness = `${domain ? `${domain}/` : ''}${path}`;
-			remote = groups[uniqueness];
-			if (remote === undefined) {
-				const provider = providerFactory(url, domain, path);
-
-				remote = new GitRemote(
-					repoPath,
-					uniqueness,
-					// Stops excessive memory usage -- https://bugs.chromium.org/p/v8/issues/detail?id=2869
-					` ${name}`.substr(1),
-					scheme,
-					provider !== undefined ? provider.domain : domain,
-					provider !== undefined ? provider.path : path,
-					provider,
-					// Stops excessive memory usage -- https://bugs.chromium.org/p/v8/issues/detail?id=2869
-					[{ url: url, type: ` ${type}`.substr(1) as GitRemoteType }],
-				);
-				remotes.push(remote);
-				groups[uniqueness] = remote;
-			} else {
-				// Stops excessive memory usage -- https://bugs.chromium.org/p/v8/issues/detail?id=2869
-				remote.urls.push({ url: url, type: ` ${type}`.substr(1) as GitRemoteType });
-			}
-		} while (true);
-
-		return remotes;
-	}
-
-	static parseGitUrl(url: string): [string, string, string] {
-		const match = urlRegex.exec(url);
-		if (match == null) return [emptyStr, emptyStr, url];
-
-		return [
-			match[1] || match[3] || match[6],
-			match[2] || match[4] || match[5] || match[7] || match[8],
-			match[9].replace(/\.git\/?$/, emptyStr),
-		];
-	}
+	return [
+		match[1] || match[3] || match[6],
+		match[2] || match[4] || match[5] || match[7] || match[8],
+		match[9].replace(gitSuffixRegex, ''),
+	];
 }

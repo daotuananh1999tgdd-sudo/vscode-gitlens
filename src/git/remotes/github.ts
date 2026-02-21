@@ -1,83 +1,230 @@
-import { AuthenticationSession, Range, Uri } from 'vscode';
-import { DynamicAutolinkReference } from '../../annotations/autolinks';
-import { AutolinkReference } from '../../config';
-import { Container } from '../../container';
-import {
-	Account,
-	DefaultBranch,
-	GitRevision,
-	IssueOrPullRequest,
-	PullRequest,
-	PullRequestState,
-	Repository,
-} from '../models';
-import { RichRemoteProvider } from './provider';
+import type { Range } from 'vscode';
+import { Uri } from 'vscode';
+import type {
+	Autolink,
+	AutolinkReference,
+	DynamicAutolinkReference,
+	MaybeEnrichedAutolink,
+} from '../../autolinks/models/autolinks.js';
+import { GlyphChars } from '../../constants.js';
+import type { Source } from '../../constants.telemetry.js';
+import type { Container } from '../../container.js';
+import type { GitHubRepositoryDescriptor } from '../../plus/integrations/providers/github.js';
+import type { Brand, Unbrand } from '../../system/brand.js';
+import { fromNow } from '../../system/date.js';
+import { memoize } from '../../system/decorators/memoize.js';
+import { encodeUrl } from '../../system/encoding.js';
+import { escapeMarkdown, unescapeMarkdown } from '../../system/markdown.js';
+import { equalsIgnoreCase } from '../../system/string.js';
+import type { CreatePullRequestRemoteResource } from '../models/remoteResource.js';
+import type { Repository } from '../models/repository.js';
+import type { GkProviderId } from '../models/repositoryIdentities.js';
+import type { GitRevisionRangeNotation } from '../models/revision.js';
+import { getIssueOrPullRequestMarkdownIcon } from '../utils/-webview/icons.js';
+import { describePullRequestWithAI } from '../utils/-webview/pullRequest.utils.js';
+import { isSha } from '../utils/revision.utils.js';
+import type {
+	LocalInfoFromRemoteUriResult,
+	RemoteProviderId,
+	RemoteProviderSupportedFeatures,
+} from './remoteProvider.js';
+import { RemoteProvider } from './remoteProvider.js';
 
-const issueEnricher3rdPartyRegex = /\b(?<repo>[^/\s]+\/[^/\s]+)\\#(?<num>[0-9]+)\b(?!]\()/g;
+const autolinkFullIssuesRegex = /\b([^/\s]+\/[^/\s]+?)(?:\\)?#([0-9]+)\b(?!]\()/g;
 const fileRegex = /^\/([^/]+)\/([^/]+?)\/blob(.+)$/i;
 const rangeRegex = /^L(\d+)(?:-L(\d+))?$/;
 
-const authProvider = Object.freeze({ id: 'github', scopes: ['repo', 'read:user', 'user:email'] });
+function isGitHubDotCom(domain: string): boolean {
+	return equalsIgnoreCase(domain, 'github.com');
+}
 
-export class GitHubRemote extends RichRemoteProvider {
-	protected get authProvider() {
-		return authProvider;
-	}
-
-	constructor(domain: string, path: string, protocol?: string, name?: string, custom: boolean = false) {
+export class GitHubRemote extends RemoteProvider<GitHubRepositoryDescriptor> {
+	constructor(
+		private readonly container: Container,
+		domain: string,
+		path: string,
+		protocol?: string,
+		name?: string,
+		custom: boolean = false,
+	) {
 		super(domain, path, protocol, name, custom);
 	}
 
-	get apiBaseUrl() {
-		return this.custom ? `${this.protocol}://${this.domain}/api` : `https://api.${this.domain}`;
+	get apiBaseUrl(): string {
+		return this.custom ? `${this.protocol}://${this.domain}/api/v3` : `https://api.${this.domain}`;
+	}
+
+	protected override get issueLinkPattern(): string {
+		return `${this.baseUrl}/issues/<num>`;
 	}
 
 	private _autolinks: (AutolinkReference | DynamicAutolinkReference)[] | undefined;
 	override get autolinks(): (AutolinkReference | DynamicAutolinkReference)[] {
 		if (this._autolinks === undefined) {
 			this._autolinks = [
+				...super.autolinks,
 				{
 					prefix: '#',
-					url: `${this.baseUrl}/issues/<num>`,
-					title: `Open Issue #<num> on ${this.name}`,
+					url: this.issueLinkPattern,
+					alphanumeric: false,
+					ignoreCase: false,
+					title: `Open Issue or Pull Request #<num> on ${this.name}`,
+
+					description: `${this.name} Issue or Pull Request #<num>`,
 				},
 				{
 					prefix: 'gh-',
-					url: `${this.baseUrl}/issues/<num>`,
-					title: `Open Issue #<num> on ${this.name}`,
+					url: this.issueLinkPattern,
+					alphanumeric: false,
 					ignoreCase: true,
+					title: `Open Issue or Pull Request #<num> on ${this.name}`,
+
+					description: `${this.name} Issue or Pull Request #<num>`,
 				},
 				{
-					linkify: (text: string) =>
-						text.replace(
-							issueEnricher3rdPartyRegex,
-							`[$&](${this.protocol}://${this.domain}/$<repo>/issues/$<num> "Open Issue #$<num> from $<repo> on ${this.name}")`,
-						),
+					tokenize: (
+						text: string,
+						outputFormat: 'html' | 'markdown' | 'plaintext',
+						tokenMapping: Map<string, string>,
+						enrichedAutolinks?: Map<string, MaybeEnrichedAutolink>,
+						prs?: Set<string>,
+						footnotes?: Map<number, string>,
+					) => {
+						return outputFormat === 'plaintext'
+							? text
+							: text.replace(autolinkFullIssuesRegex, (linkText: string, repo: string, num: string) => {
+									const url = encodeUrl(
+										`${this.protocol}://${this.domain}/${unescapeMarkdown(repo)}/issues/${num}`,
+									);
+									const title = ` "Open Issue or Pull Request #${num} from ${repo} on ${this.name}"`;
+
+									const token = `\x00${tokenMapping.size}\x00`;
+									if (outputFormat === 'markdown') {
+										tokenMapping.set(token, `[${linkText}](${url}${title})`);
+									} else if (outputFormat === 'html') {
+										tokenMapping.set(token, `<a href="${url}" title=${title}>${linkText}</a>`);
+									}
+
+									let footnoteIndex: number;
+
+									const issueResult = enrichedAutolinks?.get(num)?.[0];
+									if (issueResult?.value != null) {
+										if (issueResult.paused) {
+											if (footnotes != null && !prs?.has(num)) {
+												footnoteIndex = footnotes.size + 1;
+												footnotes.set(
+													footnoteIndex,
+													`[${getIssueOrPullRequestMarkdownIcon()} ${
+														this.name
+													} Issue or Pull Request ${repo}#${num} $(loading~spin)](${url}${title}")`,
+												);
+											}
+										} else {
+											const issue = issueResult.value;
+											const issueTitle = escapeMarkdown(issue.title.trim());
+											if (footnotes != null && !prs?.has(num)) {
+												footnoteIndex = footnotes.size + 1;
+												footnotes.set(
+													footnoteIndex,
+													`[${getIssueOrPullRequestMarkdownIcon(
+														issue,
+													)} **${issueTitle}**](${url}${title})\\\n${GlyphChars.Space.repeat(
+														5,
+													)}${linkText} ${issue.state} ${fromNow(
+														issue.closedDate ?? issue.createdDate,
+													)}`,
+												);
+											}
+										}
+									} else if (footnotes != null && !prs?.has(num)) {
+										footnoteIndex = footnotes.size + 1;
+										footnotes.set(
+											footnoteIndex,
+											`[${getIssueOrPullRequestMarkdownIcon()} ${
+												this.name
+											} Issue or Pull Request ${repo}#${num}](${url}${title})`,
+										);
+									}
+
+									return token;
+								});
+					},
+					parse: (text: string, autolinks: Map<string, Autolink>) => {
+						let ownerAndRepo: string;
+						let num: string;
+
+						let match;
+						do {
+							match = autolinkFullIssuesRegex.exec(text);
+							if (match == null) break;
+
+							[, ownerAndRepo, num] = match;
+
+							const [owner, repo] = ownerAndRepo.split('/', 2);
+							autolinks.set(num, {
+								provider: this,
+								id: num,
+								prefix: `${ownerAndRepo}#`,
+								url: `${this.protocol}://${this.domain}/${ownerAndRepo}/issues/${num}`,
+								alphanumeric: false,
+								ignoreCase: true,
+								title: `Open Issue or Pull Request #<num> from ${ownerAndRepo} on ${this.name}`,
+
+								description: `${this.name} Issue or Pull Request ${ownerAndRepo}#${num}`,
+
+								descriptor: {
+									key: this.remoteKey,
+									owner: owner,
+									name: repo,
+								} satisfies GitHubRepositoryDescriptor,
+							});
+						} while (true);
+					},
 				},
 			];
 		}
 		return this._autolinks;
 	}
 
-	override get icon() {
+	override get avatarUri(): Uri {
+		const [owner] = this.splitPath(this.path);
+		return Uri.parse(`https://avatars.githubusercontent.com/${owner}`);
+	}
+
+	override get icon(): string {
 		return 'github';
 	}
 
-	get id() {
+	get id(): RemoteProviderId {
 		return 'github';
 	}
 
-	get name() {
+	get gkProviderId(): GkProviderId {
+		return (!isGitHubDotCom(this.domain)
+			? 'githubEnterprise'
+			: 'github') satisfies Unbrand<GkProviderId> as Brand<GkProviderId>;
+	}
+
+	get name(): string {
 		return this.formatName('GitHub');
 	}
 
-	async getLocalInfoFromRemoteUri(
-		repository: Repository,
-		uri: Uri,
-		options?: { validate?: boolean },
-	): Promise<{ uri: Uri; startLine?: number; endLine?: number } | undefined> {
+	@memoize()
+	override get repoDesc(): GitHubRepositoryDescriptor {
+		const [owner, repo] = this.splitPath(this.path);
+		return { key: this.remoteKey, owner: owner, name: repo };
+	}
+
+	override get supportedFeatures(): RemoteProviderSupportedFeatures {
+		return {
+			...super.supportedFeatures,
+			createPullRequestWithDetails: true,
+		};
+	}
+
+	async getLocalInfoFromRemoteUri(repo: Repository, uri: Uri): Promise<LocalInfoFromRemoteUriResult | undefined> {
 		if (uri.authority !== this.domain) return undefined;
-		if ((options?.validate ?? true) && !uri.path.startsWith(`/${this.path}/`)) return undefined;
+		if (!uri.path.startsWith(`/${this.path}/`)) return undefined;
 
 		let startLine;
 		let endLine;
@@ -100,12 +247,27 @@ export class GitHubRemote extends RichRemoteProvider {
 		const [, , , path] = match;
 
 		// Check for a permalink
+		let maybeShortPermalink: LocalInfoFromRemoteUriResult | undefined = undefined;
+
 		let index = path.indexOf('/', 1);
 		if (index !== -1) {
 			const sha = path.substring(1, index);
-			if (GitRevision.isSha(sha)) {
-				const uri = repository.toAbsoluteUri(path.substr(index), { validate: options?.validate });
-				if (uri != null) return { uri: uri, startLine: startLine, endLine: endLine };
+			if (isSha(sha)) {
+				const uri = await repo.getAbsoluteOrBestRevisionUri(path.substring(index), sha);
+				if (uri != null) {
+					return { uri: uri, repoPath: repo.path, rev: sha, startLine: startLine, endLine: endLine };
+				}
+			} else if (isSha(sha, true)) {
+				const uri = await repo.getAbsoluteOrBestRevisionUri(path.substring(index), sha);
+				if (uri != null) {
+					maybeShortPermalink = {
+						uri: uri,
+						repoPath: repo.path,
+						rev: sha,
+						startLine: startLine,
+						endLine: endLine,
+					};
+				}
 			}
 		}
 
@@ -117,23 +279,26 @@ export class GitHubRemote extends RichRemoteProvider {
 			index = path.lastIndexOf('/', index - 1);
 			branch = path.substring(1, index);
 
-			possibleBranches.set(branch, path.substr(index));
+			possibleBranches.set(branch, path.substring(index));
 		} while (index > 0);
 
-		if (possibleBranches.size !== 0) {
-			const { values: branches } = await repository.getBranches({
+		if (possibleBranches.size) {
+			const { values: branches } = await repo.git.branches.getBranches({
 				filter: b => b.remote && possibleBranches.has(b.getNameWithoutRemote()),
 			});
 			for (const branch of branches) {
-				const path = possibleBranches.get(branch.getNameWithoutRemote());
+				const ref = branch.getNameWithoutRemote();
+				const path = possibleBranches.get(ref);
 				if (path == null) continue;
 
-				const uri = repository.toAbsoluteUri(path, { validate: options?.validate });
-				if (uri != null) return { uri: uri, startLine: startLine, endLine: endLine };
+				const uri = await repo.getAbsoluteOrBestRevisionUri(path.substring(index), ref);
+				if (uri != null) {
+					return { uri: uri, repoPath: repo.path, rev: ref, startLine: startLine, endLine: endLine };
+				}
 			}
 		}
 
-		return undefined;
+		return maybeShortPermalink;
 	}
 
 	protected getUrlForBranches(): string {
@@ -148,20 +313,43 @@ export class GitHubRemote extends RichRemoteProvider {
 		return this.encodeUrl(`${this.baseUrl}/commit/${sha}`);
 	}
 
-	protected override getUrlForComparison(base: string, compare: string, notation: '..' | '...'): string {
-		return this.encodeUrl(`${this.baseUrl}/compare/${base}${notation}${compare}`);
+	protected override getUrlForComparison(base: string, head: string, notation: GitRevisionRangeNotation): string {
+		return this.encodeUrl(`${this.baseUrl}/compare/${base}${notation}${head}`);
 	}
 
-	protected override getUrlForCreatePullRequest(
-		base: { branch?: string; remote: { path: string; url: string } },
-		compare: { branch: string; remote: { path: string; url: string } },
-	): string | undefined {
-		if (base.remote.url === compare.remote.url) {
-			return this.encodeUrl(`${this.baseUrl}/pull/new/${base.branch ?? 'HEAD'}...${compare.branch}`);
+	protected override async getUrlForCreatePullRequest(
+		resource: CreatePullRequestRemoteResource,
+		source?: Source,
+	): Promise<string | undefined> {
+		let { base, head, details } = resource;
+
+		if (details?.describeWithAI) {
+			details = await describePullRequestWithAI(
+				this.container,
+				resource.repoPath,
+				resource,
+				source ?? { source: 'ai' },
+			);
 		}
 
-		const [owner] = compare.remote.path.split('/', 1);
-		return this.encodeUrl(`${this.baseUrl}/pull/new/${base.branch ?? 'HEAD'}...${owner}:${compare.branch}`);
+		const query = new URLSearchParams({ expand: '1' });
+		if (details?.title) {
+			query.set('title', details.title);
+		}
+		if (details?.description) {
+			query.set('body', details.description);
+		}
+
+		if (base.remote.url === head.remote.url) {
+			return base.branch
+				? `${this.encodeUrl(`${this.baseUrl}/compare/${base.branch}...${head.branch}`)}?${query.toString()}`
+				: `${this.encodeUrl(`${this.baseUrl}/compare/${head.branch}`)}?${query.toString()}`;
+		}
+
+		const [owner] = head.remote.path.split('/', 1);
+		return `${this.encodeUrl(
+			`${this.baseUrl}/compare/${base.branch ?? 'HEAD'}...${owner}:${head.branch}`,
+		)}?${query.toString()}`;
 	}
 
 	protected getUrlForFile(fileName: string, branch?: string, sha?: string, range?: Range): string {
@@ -180,80 +368,16 @@ export class GitHubRemote extends RichRemoteProvider {
 		if (branch) return `${this.encodeUrl(`${this.baseUrl}/blob/${branch}/${fileName}`)}${line}`;
 		return `${this.encodeUrl(`${this.baseUrl}?path=${fileName}`)}${line}`;
 	}
+}
 
-	protected async getProviderAccountForCommit(
-		{ accessToken }: AuthenticationSession,
-		ref: string,
-		options?: {
-			avatarSize?: number;
-		},
-	): Promise<Account | undefined> {
-		const [owner, repo] = this.splitPath();
-		return (await Container.instance.github)?.getAccountForCommit(this, accessToken, owner, repo, ref, {
-			...options,
-			baseUrl: this.apiBaseUrl,
-		});
-	}
+const gitHubNoReplyAddressRegex = /^(?:(\d+)\+)?([a-zA-Z\d-]{1,39})@users\.noreply\.(.*)$/i;
 
-	protected async getProviderAccountForEmail(
-		{ accessToken }: AuthenticationSession,
-		email: string,
-		options?: {
-			avatarSize?: number;
-		},
-	): Promise<Account | undefined> {
-		const [owner, repo] = this.splitPath();
-		return (await Container.instance.github)?.getAccountForEmail(this, accessToken, owner, repo, email, {
-			...options,
-			baseUrl: this.apiBaseUrl,
-		});
-	}
+export function getGitHubNoReplyAddressParts(
+	email: string,
+): { userId: string; login: string; authority: string } | undefined {
+	const match = gitHubNoReplyAddressRegex.exec(email);
+	if (match == null) return undefined;
 
-	protected async getProviderDefaultBranch({
-		accessToken,
-	}: AuthenticationSession): Promise<DefaultBranch | undefined> {
-		const [owner, repo] = this.splitPath();
-		return (await Container.instance.github)?.getDefaultBranch(this, accessToken, owner, repo, {
-			baseUrl: this.apiBaseUrl,
-		});
-	}
-	protected async getProviderIssueOrPullRequest(
-		{ accessToken }: AuthenticationSession,
-		id: string,
-	): Promise<IssueOrPullRequest | undefined> {
-		const [owner, repo] = this.splitPath();
-		return (await Container.instance.github)?.getIssueOrPullRequest(this, accessToken, owner, repo, Number(id), {
-			baseUrl: this.apiBaseUrl,
-		});
-	}
-
-	protected async getProviderPullRequestForBranch(
-		{ accessToken }: AuthenticationSession,
-		branch: string,
-		options?: {
-			avatarSize?: number;
-			include?: PullRequestState[];
-		},
-	): Promise<PullRequest | undefined> {
-		const [owner, repo] = this.splitPath();
-		const { include, ...opts } = options ?? {};
-
-		const GitHubPullRequest = (await import(/* webpackChunkName: "github" */ '../../premium/github/github'))
-			.GitHubPullRequest;
-		return (await Container.instance.github)?.getPullRequestForBranch(this, accessToken, owner, repo, branch, {
-			...opts,
-			include: include?.map(s => GitHubPullRequest.toState(s)),
-			baseUrl: this.apiBaseUrl,
-		});
-	}
-
-	protected async getProviderPullRequestForCommit(
-		{ accessToken }: AuthenticationSession,
-		ref: string,
-	): Promise<PullRequest | undefined> {
-		const [owner, repo] = this.splitPath();
-		return (await Container.instance.github)?.getPullRequestForCommit(this, accessToken, owner, repo, ref, {
-			baseUrl: this.apiBaseUrl,
-		});
-	}
+	const [, userId, login, authority] = match;
+	return { userId: userId, login: login, authority: authority };
 }

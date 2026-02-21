@@ -1,32 +1,41 @@
 import { TreeItem, TreeItemCollapsibleState } from 'vscode';
-import { GitUri } from '../../git/gitUri';
-import { GitReflog, Repository } from '../../git/models';
-import { gate } from '../../system/decorators/gate';
-import { debug } from '../../system/decorators/log';
-import { RepositoriesView } from '../repositoriesView';
-import { LoadMoreNode, MessageNode } from './common';
-import { ReflogRecordNode } from './reflogRecordNode';
-import { RepositoryNode } from './repositoryNode';
-import { ContextValues, PageableViewNode, ViewNode } from './viewNode';
+import type { GitUri } from '../../git/gitUri.js';
+import type { GitReflog } from '../../git/models/reflog.js';
+import type { Repository } from '../../git/models/repository.js';
+import { trace } from '../../system/decorators/log.js';
+import type { RepositoriesView } from '../repositoriesView.js';
+import type { WorkspacesView } from '../workspacesView.js';
+import { CacheableChildrenViewNode } from './abstract/cacheableChildrenViewNode.js';
+import type { PageableViewNode, ViewNode } from './abstract/viewNode.js';
+import { ContextValues, getViewNodeId } from './abstract/viewNode.js';
+import { LoadMoreNode, MessageNode } from './common.js';
+import { ReflogRecordNode } from './reflogRecordNode.js';
 
-export class ReflogNode extends ViewNode<RepositoriesView> implements PageableViewNode {
-	static key = ':reflog';
-	static getId(repoPath: string): string {
-		return `${RepositoryNode.getId(repoPath)}${this.key}`;
-	}
+export class ReflogNode
+	extends CacheableChildrenViewNode<'reflog', RepositoriesView | WorkspacesView>
+	implements PageableViewNode
+{
+	limit: number | undefined;
 
-	private _children: ViewNode[] | undefined;
+	constructor(
+		uri: GitUri,
+		view: RepositoriesView | WorkspacesView,
+		parent: ViewNode,
+		public readonly repo: Repository,
+	) {
+		super('reflog', uri, view, parent);
 
-	constructor(uri: GitUri, view: RepositoriesView, parent: ViewNode, public readonly repo: Repository) {
-		super(uri, view, parent);
+		this.updateContext({ repository: repo });
+		this._uniqueId = getViewNodeId(this.type, this.context);
+		this.limit = this.view.getNodeLastKnownLimit(this);
 	}
 
 	override get id(): string {
-		return ReflogNode.getId(this.repo.path);
+		return this._uniqueId;
 	}
 
 	async getChildren(): Promise<ViewNode[]> {
-		if (this._children === undefined) {
+		if (this.children === undefined) {
 			const children = [];
 
 			const reflog = await this.getReflog();
@@ -37,12 +46,12 @@ export class ReflogNode extends ViewNode<RepositoriesView> implements PageableVi
 			children.push(...reflog.records.map(r => new ReflogRecordNode(this.view, this, r)));
 
 			if (reflog.hasMore) {
-				children.push(new LoadMoreNode(this.view, this, children[children.length - 1]));
+				children.push(new LoadMoreNode(this.view, this, children.at(-1)!));
 			}
 
-			this._children = children;
+			this.children = children;
 		}
-		return this._children;
+		return this.children;
 	}
 
 	getTreeItem(): TreeItem {
@@ -58,19 +67,18 @@ export class ReflogNode extends ViewNode<RepositoriesView> implements PageableVi
 		return item;
 	}
 
-	@gate()
-	@debug()
-	override refresh(reset?: boolean) {
-		this._children = undefined;
+	@trace()
+	override refresh(reset?: boolean): void | { cancel: boolean } | Promise<void | { cancel: boolean }> {
 		if (reset) {
 			this._reflog = undefined;
 		}
+		return super.refresh(true);
 	}
 
 	private _reflog: GitReflog | undefined;
 	private async getReflog() {
 		if (this._reflog === undefined) {
-			this._reflog = await this.view.container.git.getIncomingActivity(this.repo.path, {
+			this._reflog = await this.repo.git.commits.getIncomingActivity?.({
 				all: true,
 				limit: this.limit ?? this.view.config.defaultItemLimit,
 			});
@@ -79,14 +87,13 @@ export class ReflogNode extends ViewNode<RepositoriesView> implements PageableVi
 		return this._reflog;
 	}
 
-	get hasMore() {
+	get hasMore(): boolean {
 		return this._reflog?.hasMore ?? true;
 	}
 
-	limit: number | undefined = this.view.getNodeLastKnownLimit(this);
-	async loadMore(limit?: number) {
+	async loadMore(limit?: number): Promise<void> {
 		let reflog = await this.getReflog();
-		if (reflog === undefined || !reflog.hasMore) return;
+		if (!reflog?.hasMore) return;
 
 		reflog = await reflog.more?.(limit ?? this.view.config.pageItemLimit);
 		if (this._reflog === reflog) return;
